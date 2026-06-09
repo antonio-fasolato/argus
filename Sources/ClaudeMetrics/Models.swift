@@ -284,3 +284,33 @@ struct ModelPricingTable {
         return Price(inputPerMTok: 3.0, outputPerMTok: 15.0, cacheReadPerMTok: 0.30, cacheWritePerMTok: 3.75)
     }
 }
+
+// MARK: - Export builders (pure functions, shared by legacy + filtered export; unit-tested in Tests/)
+
+func buildSessionsCSV(_ sessions: [SessionSummary]) -> String {
+    var csv = "session_id,project,date,messages,output_tokens,cost_usd,is_subagent,model\n"
+    for s in sessions {
+        let row = "\"\(s.sessionId)\",\"\(s.project)\",\(s.firstDay),\(s.messageCount),\(s.outputTokens),\(s.costUSD),\(s.isSubagent ? 1 : 0),\"\(s.topModel)\"\n"
+        csv += row
+    }
+    return csv
+}
+
+func buildSessionsJSON(_ sessions: [SessionSummary]) -> Data? {
+    struct SessionExport: Encodable {
+        let sessionId, project, firstDay, topModel: String
+        let messageCount, outputTokens: Int
+        let costUSD: Double
+        let isSubagent: Bool
+        let rating: Int?
+    }
+    let payload = sessions.map { s in
+        SessionExport(sessionId: s.sessionId, project: s.project, firstDay: s.firstDay,
+                      topModel: s.topModel, messageCount: s.messageCount,
+                      outputTokens: s.outputTokens, costUSD: s.costUSD,
+                      isSubagent: s.isSubagent, rating: s.rating)
+    }
+    let enc = JSONEncoder()
+    enc.outputFormatting = [.prettyPrinted, .sortedKeys]
+    return try? enc.encode(payload)
+}

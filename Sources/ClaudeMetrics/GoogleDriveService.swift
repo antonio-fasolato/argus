@@ -69,6 +69,15 @@ final class GoogleDriveService: NSObject, ObservableObject {
     private var accessToken: String?
     private var accessTokenExpiry: Date?
 
+    // Dedicated session: the shared one has a 60s request timeout, far too long
+    // for the UI to sit on a spinner when the network is down.
+    private static let session: URLSession = {
+        let config = URLSessionConfiguration.ephemeral
+        config.timeoutIntervalForRequest = 15
+        config.timeoutIntervalForResource = 120   // uploads can be large
+        return URLSession(configuration: config)
+    }()
+
     // MARK: Init — restore persisted state
     override init() {
         super.init()
@@ -186,7 +195,12 @@ final class GoogleDriveService: NSObject, ObservableObject {
         req.httpMethod = "POST"
         req.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
         req.httpBody = body.percentEncoded()
-        let (data, _) = try await URLSession.shared.data(for: req)
+        let (data, resp_) = try await Self.session.data(for: req)
+        if let http = resp_ as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
+            // An invalid/revoked refresh token means we're effectively logged out
+            GDKeychain.delete(key: "refreshToken")
+            throw GDError.tokenRefreshFailed(Self.apiErrorMessage(from: data) ?? "HTTP \(http.statusCode)")
+        }
         let resp = try JSONDecoder().decode(TokenResponse.self, from: data)
         accessToken       = resp.access_token
         accessTokenExpiry = Date().addingTimeInterval(Double(resp.expires_in - 30))
@@ -221,11 +235,28 @@ final class GoogleDriveService: NSObject, ObservableObject {
         req.setValue("multipart/related; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
         req.httpBody = body
 
-        let (respData, httpResp) = try await URLSession.shared.data(for: req)
+        let (respData, httpResp) = try await Self.session.data(for: req)
         guard let http = httpResp as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
-            let msg = String(data: respData, encoding: .utf8) ?? "Unknown error"
+            let msg = Self.apiErrorMessage(from: respData)
+                ?? String(data: respData, encoding: .utf8)
+                ?? "Unknown error"
             throw GDError.uploadFailed("HTTP \((httpResp as? HTTPURLResponse)?.statusCode ?? -1): \(msg)")
         }
+    }
+
+    /// Extracts a human-readable message from a Google API error body.
+    /// Handles both shapes: `{"error": {"message": ...}}` (Drive API)
+    /// and `{"error": "...", "error_description": "..."}` (OAuth endpoints).
+    private static func apiErrorMessage(from data: Data) -> String? {
+        guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        if let err = obj["error"] as? [String: Any], let msg = err["message"] as? String {
+            return msg
+        }
+        if let err = obj["error"] as? String {
+            let desc = obj["error_description"] as? String
+            return desc.map { "\(err): \($0)" } ?? err
+        }
+        return nil
     }
 
     // MARK: - Folder ID extraction
@@ -268,7 +299,10 @@ final class GoogleDriveService: NSObject, ObservableObject {
         req.httpMethod = "POST"
         req.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
         req.httpBody = body.percentEncoded()
-        let (data, _) = try await URLSession.shared.data(for: req)
+        let (data, resp) = try await Self.session.data(for: req)
+        if let http = resp as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
+            throw GDError.tokenRefreshFailed(Self.apiErrorMessage(from: data) ?? "HTTP \(http.statusCode)")
+        }
         // Try to decode; if refresh_token is absent the exchange failed
         struct RawTokens: Decodable {
             let access_token: String
@@ -285,7 +319,7 @@ final class GoogleDriveService: NSObject, ObservableObject {
     private func fetchEmail(accessToken: String) async throws -> String {
         var req = URLRequest(url: URL(string: "https://www.googleapis.com/oauth2/v3/userinfo")!)
         req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
-        let (data, _) = try await URLSession.shared.data(for: req)
+        let (data, _) = try await Self.session.data(for: req)
         struct UserInfo: Decodable { let email: String? }
         return try JSONDecoder().decode(UserInfo.self, from: data).email ?? "Google Drive"
     }
@@ -333,6 +367,7 @@ enum GDError: LocalizedError {
     case noCodeInCallback
     case noRefreshToken
     case notAuthenticated
+    case tokenRefreshFailed(String)
     case uploadFailed(String)
 
     var errorDescription: String? {
@@ -342,6 +377,7 @@ enum GDError: LocalizedError {
         case .noCodeInCallback:   return "Il callback Google non contiene un codice di autorizzazione"
         case .noRefreshToken:     return "Google non ha restituito un refresh token (riprova, assicurati di dare il consenso)"
         case .notAuthenticated:   return "Non connesso a Google Drive — effettua il login prima di esportare"
+        case .tokenRefreshFailed(let m): return "Autenticazione Google fallita: \(m) — riconnetti l'account e riprova"
         case .uploadFailed(let m): return "Upload su Drive fallito: \(m)"
         }
     }

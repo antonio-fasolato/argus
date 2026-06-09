@@ -21,6 +21,14 @@ cp Sources/ClaudeMetrics/GoogleCredentials.swift.example \
 
 Build target is **macOS 26** (`-target arm64-apple-macosx26.0`). Required for Liquid Glass APIs (`glassEffect`).
 
+## Tests
+
+```bash
+bash Tests/run_tests.sh
+```
+
+Standalone harness (no SPM/XCTest): compiles `Models.swift` + `Theme.swift` + `Tests/main.swift` with `swiftc` and runs the binary (exit 1 on failure). Covers pure logic only: `ModelPricingTable` (cost math, lookup fallbacks, external overrides), `buildSessionsCSV`/`buildSessionsJSON`, formatters. Keep `Tests/main.swift` free of dependencies on other source files so it stays fast to compile.
+
 ## Release
 
 ```bash
@@ -69,6 +77,7 @@ bash release.sh 1.2.0   # oppure senza argomento: chiede la versione interattiva
 
 - JSONL files are the source of truth (written by Claude Code, never modified by ArgusAI).
 - `ArgusDB` tracks `lines_processed` per file in the `ingested_files` table — only new lines are read on each 3s refresh.
+- `ingestFiles()` returns an `IngestReport` (unreadable files + malformed lines skipped); `MetricsStore` accumulates the counters (`ingestSkippedLines`/`ingestUnreadableFiles`) and the sidebar footer shows an orange warning when > 0.
 - All KPI queries run as SQL against indexed tables; **never re-parse JSONL in Swift**.
 - Ingestion uses `INSERT OR REPLACE` (not `INSERT OR IGNORE`) so that corrected fields (e.g. `web_searches`) are always up to date on re-ingest.
 - **Dedup**: Claude Code sometimes writes the same API response twice to the same JSONL (identical `requestId`, consecutive lines). `ingestFiles()` uses a `seenRequestIds: Set<String>` per file, pre-seeded from the DB, to skip duplicates across refresh cycles. A one-time migration (`argusai.dedupRequestIds.v1`) cleaned up historical duplicates using `(session_id, timestamp)`.
@@ -141,6 +150,13 @@ The sidebar "PROJECT" section is only shown when `knownProjects.count > 1`.
 
 **Pattern:** every KPI has a `filteredXxx` computed property in `MetricsStore` that slices the relevant `[DailyXxx]` array from `StatsCache` by date, then aggregates. Never read raw all-time stats directly in views; always use the `filtered*` variant.
 
+The date window logic is centralized in `MetricsStore`:
+- `dateFilterWindow: Range<Date>?` — half-open `[start, end)` window for the current filter (`nil` = `.all`, no filtering). The **only** place that switches on `dateFilter`.
+- `previousPeriodWindow: Range<Date>?` — same window shifted back one period for week-over-week deltas (`nil` for `.all`/`.custom`).
+- `slice(_:in:day:)` — filters an array by a "yyyy-MM-dd" key path; `slice(_:in:)` does the same for `[String: V]` dictionaries keyed by day.
+
+**When adding a new filter-aware property, do NOT write a `switch dateFilter` — call `slice(stats?.xxx ?? [], in: dateFilterWindow) { $0.date }`.**
+
 ### Custom date range
 `.custom` is set when the user picks dates via the "Da / Al" `DatePicker` rows in the sidebar. `MetricsStore` owns `customStartDate` and `customEndDate` (date-only, no time). All 11 filter switch statements handle `.custom` as `>= startOfDay(from) && < startOfDay(to+1)`. Week-over-week switches return `[]` for `.custom` (no delta badge). The segmented picker uses `DateFilter.presets` (not `allCases`) so `.custom` never appears as a segment.
 
@@ -163,7 +179,7 @@ The sidebar "PROJECT" section is only shown when `knownProjects.count > 1`.
 - All filter content (TIME RANGE, DAILY LIMIT, ACCOUNT, PROJECT) lives inside the `ScrollView` so it never overflows with many projects
 - New filter sections: add a `SidebarSectionLabel("MY SECTION")` + `VStack` of `SidebarFilterRow` buttons, padded `.horizontal, 8`
 
-When adding a new filter-aware property, add all **five** cases to the switch (`.today`, `.sevenDays`, `.thirtyDays`, `.all`, `.custom`). `.today` uses `Calendar.current.startOfDay(for: Date())` as cutoff; `.sevenDays` / `.thirtyDays` use `Calendar.current.date(byAdding: .day, value: -N, to: Date())`; `.custom` uses `customStartDate`/`customEndDate` from MetricsStore.
+When adding a new filter-aware property, use the `slice(_:in:day:)` + `dateFilterWindow` helpers in `MetricsStore` (see § Date filtering) — never duplicate the `switch dateFilter` logic.
 
 Key per-day structures stored in `StatsCache`:
 | Field | Used for |

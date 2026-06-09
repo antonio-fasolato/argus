@@ -304,6 +304,20 @@ struct SidebarView: View {
                     .padding(.top, 10)
                 }
 
+                if store.ingestSkippedLines > 0 || store.ingestUnreadableFiles > 0 {
+                    HStack(spacing: 6) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.system(size: 9))
+                            .foregroundStyle(Color.orange)
+                        Text(ingestWarningText)
+                            .font(.system(size: 10))
+                            .foregroundStyle(Color.appTextTertiary)
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.top, 6)
+                    .help("Some data could not be ingested — totals may be incomplete")
+                }
+
                 Button { store.loadData() } label: {
                     HStack(spacing: 7) {
                         Image(systemName: "arrow.clockwise")
@@ -320,6 +334,13 @@ struct SidebarView: View {
             }
         }
         .background(Color.appSidebar)
+    }
+
+    private var ingestWarningText: String {
+        var parts: [String] = []
+        if store.ingestSkippedLines > 0 { parts.append("\(store.ingestSkippedLines) skipped lines") }
+        if store.ingestUnreadableFiles > 0 { parts.append("\(store.ingestUnreadableFiles) unreadable files") }
+        return parts.joined(separator: " · ")
     }
 }
 

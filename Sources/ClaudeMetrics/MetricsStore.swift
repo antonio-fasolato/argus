@@ -42,6 +42,10 @@ class MetricsStore: ObservableObject {
     }
     @Published var knownProjects: [String] = []
     @Published var showingExport: Bool = false
+    // Cumulative (per app session) counts of data skipped during ingestion —
+    // shown as a warning in the sidebar footer so partial ingest isn't silent
+    @Published var ingestSkippedLines: Int = 0
+    @Published var ingestUnreadableFiles: Int = 0
     let drive = GoogleDriveService()
     @Published var projectAlertThresholds: [String: Double] = {
         guard let data = UserDefaults.standard.data(forKey: "argusai.projectAlertThresholds"),
@@ -248,7 +252,13 @@ class MetricsStore: ObservableObject {
             UserDefaults.standard.set(true, forKey: claimKey)
         }
 
-        try db.ingestFiles(files, account: account)
+        let ingestReport = try db.ingestFiles(files, account: account)
+        if !ingestReport.isEmpty {
+            DispatchQueue.main.async {
+                self.ingestSkippedLines += ingestReport.malformedLines
+                self.ingestUnreadableFiles += ingestReport.unreadableFiles
+            }
+        }
         let feedbackURL = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".claude/argusai_feedback.jsonl")
         try? db.ingestFeedback(at: feedbackURL)
@@ -586,23 +596,63 @@ class MetricsStore: ObservableObject {
         (stats?.dailyActivity ?? []).sorted { $0.date < $1.date }
     }
 
-    var filteredActivity: [DailyActivity] {
+    // MARK: - Date filter window
+
+    /// Half-open [start, end) window for the current date filter; nil = no filtering (.all).
+    /// Single source of truth for every `filtered*` property — when adding a new
+    /// filter-aware property, slice with `slice(_:in:day:)` instead of switching on `dateFilter`.
+    private var dateFilterWindow: Range<Date>? {
+        let cal = Calendar.current
         switch dateFilter {
-        case .all: return recentActivity
+        case .all:
+            return nil
         case .today:
-            let start = Calendar.current.startOfDay(for: Date())
-            return recentActivity.filter { $0.dateValue >= start }
+            return cal.startOfDay(for: Date())..<Date.distantFuture
         case .sevenDays:
-            let cut = Calendar.current.date(byAdding: .day, value: -7, to: Date())!
-            return recentActivity.filter { $0.dateValue >= cut }
+            return cal.date(byAdding: .day, value: -7, to: Date())!..<Date.distantFuture
         case .thirtyDays:
-            let cut = Calendar.current.date(byAdding: .day, value: -30, to: Date())!
-            return recentActivity.filter { $0.dateValue >= cut }
+            return cal.date(byAdding: .day, value: -30, to: Date())!..<Date.distantFuture
         case .custom:
-            let start = Calendar.current.startOfDay(for: customStartDate)
-            let end = Calendar.current.date(byAdding: .day, value: 1, to: Calendar.current.startOfDay(for: customEndDate))!
-            return recentActivity.filter { $0.dateValue >= start && $0.dateValue < end }
+            let start = cal.startOfDay(for: customStartDate)
+            let end = cal.date(byAdding: .day, value: 1, to: cal.startOfDay(for: customEndDate))!
+            return start..<end
         }
+    }
+
+    /// Current window shifted back by one period, for week-over-week deltas;
+    /// nil for .all and .custom (no delta badge).
+    private var previousPeriodWindow: Range<Date>? {
+        let cal = Calendar.current
+        let now = Date()
+        switch dateFilter {
+        case .all, .custom:
+            return nil
+        case .today:
+            let yStart = cal.startOfDay(for: cal.date(byAdding: .day, value: -1, to: now)!)
+            return yStart..<cal.startOfDay(for: now)
+        case .sevenDays:
+            return cal.date(byAdding: .day, value: -14, to: now)!..<cal.date(byAdding: .day, value: -7, to: now)!
+        case .thirtyDays:
+            return cal.date(byAdding: .day, value: -60, to: now)!..<cal.date(byAdding: .day, value: -30, to: now)!
+        }
+    }
+
+    /// Keeps elements whose "yyyy-MM-dd" day string falls inside the window (nil = keep all).
+    private func slice<T>(_ items: [T], in window: Range<Date>?, day: (T) -> String) -> [T] {
+        guard let window else { return items }
+        let fmt = DateFormatter(); fmt.dateFormat = "yyyy-MM-dd"
+        return items.filter { window.contains(fmt.date(from: day($0)) ?? .distantPast) }
+    }
+
+    /// Same, for dictionaries keyed by "yyyy-MM-dd" day strings.
+    private func slice<V>(_ dict: [String: V], in window: Range<Date>?) -> [String: V] {
+        guard let window else { return dict }
+        let fmt = DateFormatter(); fmt.dateFormat = "yyyy-MM-dd"
+        return dict.filter { window.contains(fmt.date(from: $0.key) ?? .distantPast) }
+    }
+
+    var filteredActivity: [DailyActivity] {
+        slice(recentActivity, in: dateFilterWindow) { $0.date }
     }
 
     var filteredTotalMessages: Int {
@@ -698,24 +748,7 @@ class MetricsStore: ObservableObject {
     // MARK: - Date-filtered aggregates
 
     private var filteredDailyTotals: [DailyTokenTotals] {
-        let all = stats?.dailyTotals ?? []
-        let fmt = DateFormatter(); fmt.dateFormat = "yyyy-MM-dd"
-        switch dateFilter {
-        case .all: return all
-        case .today:
-            let start = Calendar.current.startOfDay(for: Date())
-            return all.filter { (fmt.date(from: $0.date) ?? .distantPast) >= start }
-        case .sevenDays:
-            let cut = Calendar.current.date(byAdding: .day, value: -7, to: Date())!
-            return all.filter { (fmt.date(from: $0.date) ?? .distantPast) >= cut }
-        case .thirtyDays:
-            let cut = Calendar.current.date(byAdding: .day, value: -30, to: Date())!
-            return all.filter { (fmt.date(from: $0.date) ?? .distantPast) >= cut }
-        case .custom:
-            let start = Calendar.current.startOfDay(for: customStartDate)
-            let end = Calendar.current.date(byAdding: .day, value: 1, to: Calendar.current.startOfDay(for: customEndDate))!
-            return all.filter { let d = fmt.date(from: $0.date) ?? .distantPast; return d >= start && d < end }
-        }
+        slice(stats?.dailyTotals ?? [], in: dateFilterWindow) { $0.date }
     }
 
     var filteredTotalCost:    Double { filteredDailyTotals.reduce(0) { $0 + $1.estimatedCostUSD } }
@@ -812,24 +845,7 @@ class MetricsStore: ObservableObject {
     // MARK: - Filtered model stats
 
     private var filteredModelBreakdownDays: [DailyModelBreakdown] {
-        let all = stats?.dailyModelBreakdown ?? []
-        let fmt = DateFormatter(); fmt.dateFormat = "yyyy-MM-dd"
-        switch dateFilter {
-        case .all: return all
-        case .today:
-            let start = Calendar.current.startOfDay(for: Date())
-            return all.filter { (fmt.date(from: $0.date) ?? .distantPast) >= start }
-        case .sevenDays:
-            let cut = Calendar.current.date(byAdding: .day, value: -7, to: Date())!
-            return all.filter { (fmt.date(from: $0.date) ?? .distantPast) >= cut }
-        case .thirtyDays:
-            let cut = Calendar.current.date(byAdding: .day, value: -30, to: Date())!
-            return all.filter { (fmt.date(from: $0.date) ?? .distantPast) >= cut }
-        case .custom:
-            let start = Calendar.current.startOfDay(for: customStartDate)
-            let end = Calendar.current.date(byAdding: .day, value: 1, to: Calendar.current.startOfDay(for: customEndDate))!
-            return all.filter { let d = fmt.date(from: $0.date) ?? .distantPast; return d >= start && d < end }
-        }
+        slice(stats?.dailyModelBreakdown ?? [], in: dateFilterWindow) { $0.date }
     }
 
     var filteredModelUsage: [String: ModelTokenStats] {
@@ -864,24 +880,7 @@ class MetricsStore: ObservableObject {
     // MARK: - Filtered hourly data
 
     private var filteredDailyHourCounts: [String: [String: Int]] {
-        let all = stats?.dailyHourCounts ?? [:]
-        let fmt = DateFormatter(); fmt.dateFormat = "yyyy-MM-dd"
-        switch dateFilter {
-        case .all: return all
-        case .today:
-            let start = Calendar.current.startOfDay(for: Date())
-            return all.filter { (fmt.date(from: $0.key) ?? .distantPast) >= start }
-        case .sevenDays:
-            let cut = Calendar.current.date(byAdding: .day, value: -7, to: Date())!
-            return all.filter { (fmt.date(from: $0.key) ?? .distantPast) >= cut }
-        case .thirtyDays:
-            let cut = Calendar.current.date(byAdding: .day, value: -30, to: Date())!
-            return all.filter { (fmt.date(from: $0.key) ?? .distantPast) >= cut }
-        case .custom:
-            let start = Calendar.current.startOfDay(for: customStartDate)
-            let end = Calendar.current.date(byAdding: .day, value: 1, to: Calendar.current.startOfDay(for: customEndDate))!
-            return all.filter { let d = fmt.date(from: $0.key) ?? .distantPast; return d >= start && d < end }
-        }
+        slice(stats?.dailyHourCounts ?? [:], in: dateFilterWindow)
     }
 
     var filteredHourlyData: [(hour: Int, count: Int)] {
@@ -901,24 +900,7 @@ class MetricsStore: ObservableObject {
     // MARK: - Filtered project stats
 
     private var filteredDailyProjCosts: [DailyProjectCosts] {
-        let all = stats?.dailyProjectCosts ?? []
-        let fmt = DateFormatter(); fmt.dateFormat = "yyyy-MM-dd"
-        switch dateFilter {
-        case .all: return all
-        case .today:
-            let start = Calendar.current.startOfDay(for: Date())
-            return all.filter { (fmt.date(from: $0.date) ?? .distantPast) >= start }
-        case .sevenDays:
-            let cut = Calendar.current.date(byAdding: .day, value: -7, to: Date())!
-            return all.filter { (fmt.date(from: $0.date) ?? .distantPast) >= cut }
-        case .thirtyDays:
-            let cut = Calendar.current.date(byAdding: .day, value: -30, to: Date())!
-            return all.filter { (fmt.date(from: $0.date) ?? .distantPast) >= cut }
-        case .custom:
-            let start = Calendar.current.startOfDay(for: customStartDate)
-            let end = Calendar.current.date(byAdding: .day, value: 1, to: Calendar.current.startOfDay(for: customEndDate))!
-            return all.filter { let d = fmt.date(from: $0.date) ?? .distantPast; return d >= start && d < end }
-        }
+        slice(stats?.dailyProjectCosts ?? [], in: dateFilterWindow) { $0.date }
     }
 
     var filteredSortedProjects: [ProjectStats] {
@@ -983,24 +965,7 @@ class MetricsStore: ObservableObject {
 
     // Work hours
     var workHoursData: [DailyWorkHours] {
-        let all = stats?.dailyWorkHours?.sorted { $0.date < $1.date } ?? []
-        let fmt = DateFormatter(); fmt.dateFormat = "yyyy-MM-dd"
-        switch dateFilter {
-        case .all: return all
-        case .today:
-            let start = Calendar.current.startOfDay(for: Date())
-            return all.filter { (fmt.date(from: $0.date) ?? .distantPast) >= start }
-        case .sevenDays:
-            let cut = Calendar.current.date(byAdding: .day, value: -7, to: Date())!
-            return all.filter { (fmt.date(from: $0.date) ?? .distantPast) >= cut }
-        case .thirtyDays:
-            let cut = Calendar.current.date(byAdding: .day, value: -30, to: Date())!
-            return all.filter { (fmt.date(from: $0.date) ?? .distantPast) >= cut }
-        case .custom:
-            let start = Calendar.current.startOfDay(for: customStartDate)
-            let end = Calendar.current.date(byAdding: .day, value: 1, to: Calendar.current.startOfDay(for: customEndDate))!
-            return all.filter { let d = fmt.date(from: $0.date) ?? .distantPast; return d >= start && d < end }
-        }
+        slice(stats?.dailyWorkHours?.sorted { $0.date < $1.date } ?? [], in: dateFilterWindow) { $0.date }
     }
 
     var avgStartHour: Double? {
@@ -1019,24 +984,7 @@ class MetricsStore: ObservableObject {
     // MARK: - Sessions
 
     var filteredSessions: [SessionSummary] {
-        let all = stats?.sessions ?? []
-        let fmt = DateFormatter(); fmt.dateFormat = "yyyy-MM-dd"
-        switch dateFilter {
-        case .all: return all
-        case .today:
-            let start = Calendar.current.startOfDay(for: Date())
-            return all.filter { (fmt.date(from: $0.firstDay) ?? .distantPast) >= start }
-        case .sevenDays:
-            let cut = Calendar.current.date(byAdding: .day, value: -7, to: Date())!
-            return all.filter { (fmt.date(from: $0.firstDay) ?? .distantPast) >= cut }
-        case .thirtyDays:
-            let cut = Calendar.current.date(byAdding: .day, value: -30, to: Date())!
-            return all.filter { (fmt.date(from: $0.firstDay) ?? .distantPast) >= cut }
-        case .custom:
-            let start = Calendar.current.startOfDay(for: customStartDate)
-            let end = Calendar.current.date(byAdding: .day, value: 1, to: Calendar.current.startOfDay(for: customEndDate))!
-            return all.filter { let d = fmt.date(from: $0.firstDay) ?? .distantPast; return d >= start && d < end }
-        }
+        slice(stats?.sessions ?? [], in: dateFilterWindow) { $0.firstDay }
     }
 
     var filteredAvgRating: Double? {
@@ -1090,34 +1038,8 @@ class MetricsStore: ObservableObject {
     // MARK: - Week-over-week comparison
 
     private var previousPeriodDailyTotals: [DailyTokenTotals] {
-        let all = stats?.dailyTotals ?? []
-        let fmt = DateFormatter(); fmt.dateFormat = "yyyy-MM-dd"
-        let now = Date()
-        switch dateFilter {
-        case .all, .custom: return []
-        case .today:
-            let yesterday = Calendar.current.date(byAdding: .day, value: -1, to: now)!
-            let yStart = Calendar.current.startOfDay(for: yesterday)
-            let yEnd   = Calendar.current.startOfDay(for: now)
-            return all.filter {
-                let d = fmt.date(from: $0.date) ?? .distantPast
-                return d >= yStart && d < yEnd
-            }
-        case .sevenDays:
-            let w2start = Calendar.current.date(byAdding: .day, value: -14, to: now)!
-            let w2end   = Calendar.current.date(byAdding: .day, value: -7,  to: now)!
-            return all.filter {
-                let d = fmt.date(from: $0.date) ?? .distantPast
-                return d >= w2start && d < w2end
-            }
-        case .thirtyDays:
-            let m2start = Calendar.current.date(byAdding: .day, value: -60, to: now)!
-            let m2end   = Calendar.current.date(byAdding: .day, value: -30, to: now)!
-            return all.filter {
-                let d = fmt.date(from: $0.date) ?? .distantPast
-                return d >= m2start && d < m2end
-            }
-        }
+        guard let window = previousPeriodWindow else { return [] }
+        return slice(stats?.dailyTotals ?? [], in: window) { $0.date }
     }
 
     var previousPeriodCost: Double { previousPeriodDailyTotals.reduce(0) { $0 + $1.estimatedCostUSD } }
@@ -1129,36 +1051,9 @@ class MetricsStore: ObservableObject {
     }
 
     var previousPeriodMessages: Int {
-        // Use filteredActivity pattern shifted by period
-        let all = stats?.dailyActivity ?? []
-        let fmt = DateFormatter(); fmt.dateFormat = "yyyy-MM-dd"
-        let now = Date()
-        let filtered: [DailyActivity]
-        switch dateFilter {
-        case .all, .custom: return 0
-        case .today:
-            let yStart = Calendar.current.startOfDay(for: Calendar.current.date(byAdding: .day, value: -1, to: now)!)
-            let yEnd   = Calendar.current.startOfDay(for: now)
-            filtered = all.filter {
-                let d = fmt.date(from: $0.date) ?? .distantPast
-                return d >= yStart && d < yEnd
-            }
-        case .sevenDays:
-            let w2start = Calendar.current.date(byAdding: .day, value: -14, to: now)!
-            let w2end   = Calendar.current.date(byAdding: .day, value: -7,  to: now)!
-            filtered = all.filter {
-                let d = fmt.date(from: $0.date) ?? .distantPast
-                return d >= w2start && d < w2end
-            }
-        case .thirtyDays:
-            let m2start = Calendar.current.date(byAdding: .day, value: -60, to: now)!
-            let m2end   = Calendar.current.date(byAdding: .day, value: -30, to: now)!
-            filtered = all.filter {
-                let d = fmt.date(from: $0.date) ?? .distantPast
-                return d >= m2start && d < m2end
-            }
-        }
-        return filtered.reduce(0) { $0 + $1.messageCount }
+        guard let window = previousPeriodWindow else { return 0 }
+        return slice(stats?.dailyActivity ?? [], in: window) { $0.date }
+            .reduce(0) { $0 + $1.messageCount }
     }
 
     var messagesDeltaPct: Double? {
@@ -1182,25 +1077,7 @@ class MetricsStore: ObservableObject {
     var platformDailyTotals: [DailyTokenTotals] { filteredDailyTotals }
 
     var filteredHourlyCosts: [(hour: Int, cost: Double)] {
-        let all = stats?.dailyHourCosts ?? [:]
-        let fmt = DateFormatter(); fmt.dateFormat = "yyyy-MM-dd"
-        let filtered: [String: [String: Double]]
-        switch dateFilter {
-        case .all: filtered = all
-        case .today:
-            let start = Calendar.current.startOfDay(for: Date())
-            filtered = all.filter { (fmt.date(from: $0.key) ?? .distantPast) >= start }
-        case .sevenDays:
-            let cut = Calendar.current.date(byAdding: .day, value: -7, to: Date())!
-            filtered = all.filter { (fmt.date(from: $0.key) ?? .distantPast) >= cut }
-        case .thirtyDays:
-            let cut = Calendar.current.date(byAdding: .day, value: -30, to: Date())!
-            filtered = all.filter { (fmt.date(from: $0.key) ?? .distantPast) >= cut }
-        case .custom:
-            let start = Calendar.current.startOfDay(for: customStartDate)
-            let end = Calendar.current.date(byAdding: .day, value: 1, to: Calendar.current.startOfDay(for: customEndDate))!
-            filtered = all.filter { let d = fmt.date(from: $0.key) ?? .distantPast; return d >= start && d < end }
-        }
+        let filtered = slice(stats?.dailyHourCosts ?? [:], in: dateFilterWindow)
         var totals = [Int: Double]()
         for (_, hourMap) in filtered {
             for (hStr, cost) in hourMap { if let h = Int(hStr) { totals[h, default: 0] += cost } }
@@ -1235,24 +1112,7 @@ class MetricsStore: ObservableObject {
     }
 
     private var filteredDailyAccountCosts: [DailyAccountCosts] {
-        let all = stats?.dailyAccountCosts ?? []
-        let fmt = DateFormatter(); fmt.dateFormat = "yyyy-MM-dd"
-        switch dateFilter {
-        case .all: return all
-        case .today:
-            let start = Calendar.current.startOfDay(for: Date())
-            return all.filter { (fmt.date(from: $0.date) ?? .distantPast) >= start }
-        case .sevenDays:
-            let cut = Calendar.current.date(byAdding: .day, value: -7, to: Date())!
-            return all.filter { (fmt.date(from: $0.date) ?? .distantPast) >= cut }
-        case .thirtyDays:
-            let cut = Calendar.current.date(byAdding: .day, value: -30, to: Date())!
-            return all.filter { (fmt.date(from: $0.date) ?? .distantPast) >= cut }
-        case .custom:
-            let start = Calendar.current.startOfDay(for: customStartDate)
-            let end = Calendar.current.date(byAdding: .day, value: 1, to: Calendar.current.startOfDay(for: customEndDate))!
-            return all.filter { let d = fmt.date(from: $0.date) ?? .distantPast; return d >= start && d < end }
-        }
+        slice(stats?.dailyAccountCosts ?? [], in: dateFilterWindow) { $0.date }
     }
 
     var filteredAccountCosts: [AccountCostBreakdown] {
@@ -1352,26 +1212,8 @@ class MetricsStore: ObservableObject {
     }
 
     var filteredDailyResponseTimes: [(date: String, avgSec: Double)] {
-        let all = stats?.dailyAvgResponseTimeSec ?? [:]
-        let fmt = DateFormatter(); fmt.dateFormat = "yyyy-MM-dd"
-        let filtered: [String: Double]
-        switch dateFilter {
-        case .all: filtered = all
-        case .today:
-            let start = Calendar.current.startOfDay(for: Date())
-            filtered = all.filter { (fmt.date(from: $0.key) ?? .distantPast) >= start }
-        case .sevenDays:
-            let cut = Calendar.current.date(byAdding: .day, value: -7, to: Date())!
-            filtered = all.filter { (fmt.date(from: $0.key) ?? .distantPast) >= cut }
-        case .thirtyDays:
-            let cut = Calendar.current.date(byAdding: .day, value: -30, to: Date())!
-            filtered = all.filter { (fmt.date(from: $0.key) ?? .distantPast) >= cut }
-        case .custom:
-            let start = Calendar.current.startOfDay(for: customStartDate)
-            let end = Calendar.current.date(byAdding: .day, value: 1, to: Calendar.current.startOfDay(for: customEndDate))!
-            filtered = all.filter { let d = fmt.date(from: $0.key) ?? .distantPast; return d >= start && d < end }
-        }
-        return filtered.map { (date: $0.key, avgSec: $0.value) }.sorted { $0.date < $1.date }
+        slice(stats?.dailyAvgResponseTimeSec ?? [:], in: dateFilterWindow)
+            .map { (date: $0.key, avgSec: $0.value) }.sorted { $0.date < $1.date }
     }
 
     var filteredAvgResponseTimeSec: Double? {
@@ -1515,36 +1357,6 @@ class MetricsStore: ObservableObject {
             guard response == .OK, let url = panel.url else { return }
             try? csv.write(to: url, atomically: true, encoding: .utf8)
         }
-    }
-
-    // MARK: - Export builders (pure functions, shared by legacy + filtered export)
-
-    func buildSessionsCSV(_ sessions: [SessionSummary]) -> String {
-        var csv = "session_id,project,date,messages,output_tokens,cost_usd,is_subagent,model\n"
-        for s in sessions {
-            let row = "\"\(s.sessionId)\",\"\(s.project)\",\(s.firstDay),\(s.messageCount),\(s.outputTokens),\(s.costUSD),\(s.isSubagent ? 1 : 0),\"\(s.topModel)\"\n"
-            csv += row
-        }
-        return csv
-    }
-
-    func buildSessionsJSON(_ sessions: [SessionSummary]) -> Data? {
-        struct SessionExport: Encodable {
-            let sessionId, project, firstDay, topModel: String
-            let messageCount, outputTokens: Int
-            let costUSD: Double
-            let isSubagent: Bool
-            let rating: Int?
-        }
-        let payload = sessions.map { s in
-            SessionExport(sessionId: s.sessionId, project: s.project, firstDay: s.firstDay,
-                          topModel: s.topModel, messageCount: s.messageCount,
-                          outputTokens: s.outputTokens, costUSD: s.costUSD,
-                          isSubagent: s.isSubagent, rating: s.rating)
-        }
-        let enc = JSONEncoder()
-        enc.outputFormatting = [.prettyPrinted, .sortedKeys]
-        return try? enc.encode(payload)
     }
 
     // MARK: - Filtered export (called by ExportView)

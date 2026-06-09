@@ -133,6 +133,8 @@ final class ArgusDB {
         CREATE INDEX IF NOT EXISTS idx_msg_model   ON messages(model);
         CREATE INDEX IF NOT EXISTS idx_msg_project ON messages(project);
         CREATE INDEX IF NOT EXISTS idx_msg_session ON messages(session_id);
+        CREATE INDEX IF NOT EXISTS idx_msg_day_hour ON messages(day, hour);
+        CREATE INDEX IF NOT EXISTS idx_msg_day_acct ON messages(day, account_uuid);
         CREATE INDEX IF NOT EXISTS idx_tool_day    ON tool_events(day);
         CREATE TABLE IF NOT EXISTS user_turns (
             file_path  TEXT NOT NULL,
@@ -210,17 +212,21 @@ final class ArgusDB {
     var accountFilter: String?
     var projectFilter: String?
 
-    // SQL fragments appended to WHERE — safe: values come from our own DB, not user input
+    // SQL fragments appended to WHERE. Values come from our own DB, but project names
+    // derive from directory names — escape quotes so an apostrophe can't break the query.
+    private func sqlQuote(_ value: String) -> String {
+        value.replacingOccurrences(of: "'", with: "''")
+    }
     private var af: String {
         var parts: [String] = []
-        if let f = accountFilter { parts.append("AND account_uuid = '\(f)'") }
-        if let p = projectFilter { parts.append("AND project = '\(p)'") }
+        if let f = accountFilter { parts.append("AND account_uuid = '\(sqlQuote(f))'") }
+        if let p = projectFilter { parts.append("AND project = '\(sqlQuote(p))'") }
         return parts.joined(separator: " ")
     }
     private func af(_ alias: String) -> String {
         var parts: [String] = []
-        if let f = accountFilter { parts.append("AND \(alias).account_uuid = '\(f)'") }
-        if let p = projectFilter { parts.append("AND \(alias).project = '\(p)'") }
+        if let f = accountFilter { parts.append("AND \(alias).account_uuid = '\(sqlQuote(f))'") }
+        if let p = projectFilter { parts.append("AND \(alias).project = '\(sqlQuote(p))'") }
         return parts.joined(separator: " ")
     }
 
@@ -255,7 +261,17 @@ final class ArgusDB {
 
     // MARK: - Ingestion
 
-    func ingestFiles(_ files: [(url: URL, isSubagent: Bool)], account: AccountInfo?) throws {
+    /// Counters for data silently skipped during an ingest run. Surfaced in the UI
+    /// so partial ingestion (corrupt files, malformed lines) is visible to the user.
+    struct IngestReport {
+        var unreadableFiles = 0
+        var malformedLines = 0
+        var isEmpty: Bool { unreadableFiles == 0 && malformedLines == 0 }
+    }
+
+    @discardableResult
+    func ingestFiles(_ files: [(url: URL, isSubagent: Bool)], account: AccountInfo?) throws -> IngestReport {
+        var report = IngestReport()
         // Load already-processed line counts
         var linesProcessed: [String: Int] = [:]
         do {
@@ -304,7 +320,10 @@ final class ArgusDB {
             let startLine = linesProcessed[path] ?? 0
 
             guard let data = try? Data(contentsOf: fileURL),
-                  let text = String(data: data, encoding: .utf8) else { continue }
+                  let text = String(data: data, encoding: .utf8) else {
+                report.unreadableFiles += 1
+                continue
+            }
 
             let allLines = text.split(separator: "\n", omittingEmptySubsequences: true)
             guard allLines.count > startLine else { continue }
@@ -348,7 +367,10 @@ final class ArgusDB {
             var lineNum = startLine
             for line in newLines {
                 lineNum += 1
-                guard let obj = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any] else { continue }
+                guard let obj = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any] else {
+                    report.malformedLines += 1
+                    continue
+                }
 
                 let type = obj["type"] as? String ?? ""
                 let sid  = obj["sessionId"] as? String ?? ""
@@ -457,6 +479,7 @@ final class ArgusDB {
         sqlite3_finalize(utInsert)
 
         try execSQL("COMMIT")
+        return report
     }
 
     // MARK: - Feedback ingestion
@@ -830,10 +853,10 @@ final class ArgusDB {
     /// export panel's own selectors are independent of the sidebar's live filters.
     func queryFilteredSessions(account: String?, project: String?, startDay: String?, endDay: String?) throws -> [SessionSummary] {
         var clauses: [String] = ["m.day != ''"]
-        if let a = account, !a.isEmpty { clauses.append("m.account_uuid = '\(a)'") }
-        if let p = project, !p.isEmpty { clauses.append("m.project = '\(p)'") }
-        if let s = startDay, !s.isEmpty { clauses.append("m.day >= '\(s)'") }
-        if let e = endDay,   !e.isEmpty { clauses.append("m.day <= '\(e)'") }
+        if let a = account, !a.isEmpty { clauses.append("m.account_uuid = '\(sqlQuote(a))'") }
+        if let p = project, !p.isEmpty { clauses.append("m.project = '\(sqlQuote(p))'") }
+        if let s = startDay, !s.isEmpty { clauses.append("m.day >= '\(sqlQuote(s))'") }
+        if let e = endDay,   !e.isEmpty { clauses.append("m.day <= '\(sqlQuote(e))'") }
         let where_ = clauses.joined(separator: " AND ")
         let stmt = try prepare("""
             SELECT m.session_id, m.project, MIN(m.day), COUNT(*),
@@ -1018,7 +1041,7 @@ final class ArgusDB {
 
     func queryKnownProjects() throws -> [String] {
         // Use account filter only (not project filter) so the picker always shows all projects
-        let accountClause = accountFilter.map { "AND account_uuid = '\($0)'" } ?? ""
+        let accountClause = accountFilter.map { "AND account_uuid = '\(sqlQuote($0))'" } ?? ""
         let stmt = try prepare("""
             SELECT DISTINCT project FROM messages
             WHERE project IS NOT NULL AND project != '' \(accountClause)
