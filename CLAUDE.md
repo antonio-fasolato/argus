@@ -83,7 +83,7 @@ bash release.sh 1.2.0   # oppure senza argomento: chiede la versione interattiva
 - `ingestFiles()` returns an `IngestReport` (unreadable files + malformed lines skipped); `MetricsStore` accumulates the counters (`ingestSkippedLines`/`ingestUnreadableFiles`) and the sidebar footer shows an orange warning when > 0.
 - All KPI queries run as SQL against indexed tables; **never re-parse JSONL in Swift**.
 - Ingestion uses `INSERT OR REPLACE` (not `INSERT OR IGNORE`) so that corrected fields (e.g. `web_searches`) are always up to date on re-ingest.
-- **Dedup**: Claude Code sometimes writes the same API response twice to the same JSONL (identical `requestId`, consecutive lines). `ingestFiles()` uses a `seenRequestIds: Set<String>` per file, pre-seeded from the DB, to skip duplicates across refresh cycles. A one-time migration (`argusai.dedupRequestIds.v1`) cleaned up historical duplicates using `(session_id, timestamp)`.
+- **Dedup**: Claude Code writes multiple `assistant` lines per `requestId` while streaming (one per content block) with **cumulative** usage — the last line has the final token counts. `ingestFiles()` keeps a **global** `seenRequests: [rid → (file, line)]` map (lazy pre-seed from DB): same rid in the same file → UPDATE the kept row with last-wins tokens and **additive** `web_searches`/`ai_lines`; same rid in a different file (compaction agent copies) → skip. The rid is registered only after the `usage > 0` guard, so a zero-usage first line can't shadow the real one. One-shots: `argusai.dedupRequestIds.v1` (legacy, by `(session_id, timestamp)`) and `argusai.dedupFinalUsage.v1` (drops cross-file copies, applies final cumulative usage).
 - **Cost estimation**: JSONL files do NOT contain a `costUSD` field. ArgusAI estimates costs using `ModelPricingTable` (public API prices). Actual billing may differ by ~10–15% due to plan pricing, billing cycle, or cache tier differences. An external override file `~/.claude/argus_pricing.json` can override per-model prices.
 
 ### Adding a new data point
@@ -152,7 +152,9 @@ The sidebar "PROJECT" section is only shown when `knownProjects.count > 1`.
 
 ## Date filtering
 
-`MetricsStore.dateFilter: DateFilter` (`.today` / `.sevenDays` / `.thirtyDays` / `.all` / `.custom`) drives all views.
+`MetricsStore.dateFilter: DateFilter` (`.today` / `.sevenDays` / `.thirtyDays` / `.all` / `.custom` / `.cycle`) drives all views.
+
+`.cycle` mirrors the subscription billing window of the desktop "$ of $200" counter: `MetricsStore.billingCycleResetDay` (1–28, UserDefaults `argusai.billingCycleResetDay`, nil = off, set in Settings → General) → `billingCycleStart` computes the most recent reset day → `dateFilterWindow` returns `[start, ∞)`. The sidebar shows a "Billing Cycle" row only when a reset day is configured; no week-over-week delta (like `.custom`).
 
 **Pattern:** every KPI has a `filteredXxx` computed property in `MetricsStore` that slices the relevant `[DailyXxx]` array from `StatsCache` by date, then aggregates. Never read raw all-time stats directly in views; always use the `filtered*` variant.
 
@@ -241,6 +243,7 @@ Key per-day structures stored in `StatsCache`:
 | **Chart tooltips** | `chartXSelection` + overlay on `ActivityBarChart` (date → msg count) and `HourlyBarChart` (hour → msg count) |
 | **Sortable Projects table** | `ProjectSortKey` enum + `sorted` computed var in `ProjectTable`; click any column header (PROJECT/MSG/OUTPUT/COST/WEB/% AI) to sort |
 | **Custom date range** | "Da / Al" `DatePicker` rows in sidebar (indented under "Custom" `SidebarFilterRow`); selecting a date activates `.custom` filter; clicking a preset deactivates it |
+| **Billing Cycle preset** | `DateFilter.cycle` + `billingCycleResetDay` (Settings → General, 1–28) → "Billing Cycle" row in sidebar TIME RANGE; window = most recent reset day → today, mirrors the desktop "$ of $200" counter |
 | **Chart crosshair** | `ChartCrosshair` helper in `Components.swift` — vertical + horizontal dashed lines, intersection dot, floating tooltip; applied to all line charts (Daily Messages, Daily Cost, Daily Cost Trend, Output/Context Ratio, Token Trend) |
 | **Click-to-explain** | `DailyCostExplainView` popover in `OverviewView.swift`; clicking the Daily Cost chart opens a breakdown by model + project, raw SQL, copy button |
 | **Session detail view** | Click any row in Sessions tab → `SessionDetailView` sheet; per-message breakdown (time, model, all token types, cost, ai_lines); footer row with session totals; data from `ArgusDB.querySessionMessages(sessionId:)` |

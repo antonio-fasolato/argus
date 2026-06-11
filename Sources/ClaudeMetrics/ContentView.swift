@@ -187,6 +187,14 @@ struct SidebarView: View {
                                 store.dateFilter = filter
                             }
                         }
+                        // Mirrors the desktop "$ of $200" counter window; shown only
+                        // when a reset day is configured in Settings → General
+                        if store.billingCycleResetDay != nil {
+                            SidebarFilterRow(icon: "creditcard", label: "Billing Cycle",
+                                             isSelected: store.dateFilter == .cycle) {
+                                store.dateFilter = .cycle
+                            }
+                        }
                     }
                     .padding(.horizontal, 8)
 

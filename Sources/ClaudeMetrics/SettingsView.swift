@@ -24,6 +24,7 @@ struct SettingsView: View {
 
 struct GeneralSettingsTab: View {
     @AppStorage("argusai.colorScheme") var colorScheme: String = "system"
+    @EnvironmentObject var store: MetricsStore
 
     var body: some View {
         Form {
@@ -34,6 +35,22 @@ struct GeneralSettingsTab: View {
                     Text("Light").tag("light")
                 }
                 .pickerStyle(.segmented)
+            }
+            Section("Billing Cycle") {
+                HStack {
+                    Text("Reset day of month")
+                    Spacer()
+                    TextField("Off", value: Binding(
+                        get: { store.billingCycleResetDay ?? 0 },
+                        set: { store.billingCycleResetDay = (1...28).contains($0) ? $0 : nil }
+                    ), format: .number)
+                    .textFieldStyle(.roundedBorder)
+                    .multilineTextAlignment(.trailing)
+                    .frame(width: 60)
+                }
+                Text("The Claude desktop/claude.ai \"$ of $200\" counter follows your subscription cycle, not the calendar month. Set the day it resets (1–28) to get a \"Billing Cycle\" preset in the sidebar; 0 disables it.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
             Section("Data") {
                 LabeledContent("Auto-refresh", value: "Every 3 seconds")

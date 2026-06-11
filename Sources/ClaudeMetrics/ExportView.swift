@@ -219,6 +219,9 @@ struct ExportView: View {
             case .thirtyDays:
                 startDate = cal.date(byAdding: .day, value: -30, to: Date())!
                 endDate   = Date()
+            case .cycle:
+                startDate = store.billingCycleStart ?? cal.startOfDay(for: Date())
+                endDate   = Date()
             default: break
             }
         } else if store.dateFilter == .custom {

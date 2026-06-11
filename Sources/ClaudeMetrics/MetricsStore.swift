@@ -10,6 +10,7 @@ enum DateFilter: String, CaseIterable {
     case thirtyDays = "30d"
     case all        = "All"
     case custom     = "Custom"
+    case cycle      = "Cycle"   // subscription billing cycle; shown only when a reset day is set
 
     static let presets: [DateFilter] = [.today, .sevenDays, .thirtyDays, .all]
 }
@@ -45,6 +46,17 @@ class MetricsStore: ObservableObject {
         didSet { if oldValue != sourceFilter { loadData(silent: true) } }
     }
     @Published var knownSources: [String] = []
+    // Day of month (1–28) the subscription's "$ of $200" counter resets; nil = off.
+    // Enables the "Billing Cycle" preset in the sidebar to mirror the desktop counter window.
+    @Published var billingCycleResetDay: Int? = {
+        let v = UserDefaults.standard.integer(forKey: "argusai.billingCycleResetDay")
+        return (1...28).contains(v) ? v : nil
+    }() {
+        didSet {
+            UserDefaults.standard.set(billingCycleResetDay ?? 0, forKey: "argusai.billingCycleResetDay")
+            if billingCycleResetDay == nil && dateFilter == .cycle { dateFilter = .all }
+        }
+    }
     @Published var showingExport: Bool = false
     // Cumulative (per app session) counts of data skipped during ingestion —
     // shown as a warning in the sidebar footer so partial ingest isn't silent
@@ -319,6 +331,17 @@ class MetricsStore: ObservableObject {
             } catch {
                 // Flag stays unset so the recompute retries on next launch
                 NSLog("ArgusAI: pricing recompute failed — %@", "\(error)")
+            }
+        }
+        // One-shot for the dedup semantics change: drop cross-file copies, apply final
+        // cumulative usage to requests streamed across multiple lines
+        let dedupKey = "argusai.dedupFinalUsage.v1"
+        if !UserDefaults.standard.bool(forKey: dedupKey) {
+            do {
+                try db.backfillDedupFinalUsage()
+                UserDefaults.standard.set(true, forKey: dedupKey)
+            } catch {
+                NSLog("ArgusAI: dedup backfill failed — %@", "\(error)")
             }
         }
         db.accountFilter = currentFilter
@@ -673,16 +696,33 @@ class MetricsStore: ObservableObject {
             let start = cal.startOfDay(for: customStartDate)
             let end = cal.date(byAdding: .day, value: 1, to: cal.startOfDay(for: customEndDate))!
             return start..<end
+        case .cycle:
+            guard let start = billingCycleStart else { return nil }
+            return start..<Date.distantFuture
         }
     }
 
+    /// Start of the current subscription billing cycle (most recent reset day);
+    /// nil when no reset day is configured. Internal so ExportView can mirror it.
+    var billingCycleStart: Date? {
+        guard let day = billingCycleResetDay else { return nil }
+        let cal = Calendar.current
+        let today = cal.startOfDay(for: Date())
+        var comps = cal.dateComponents([.year, .month], from: today)
+        comps.day = day
+        guard let resetThisMonth = cal.date(from: comps) else { return nil }
+        return resetThisMonth <= today
+            ? resetThisMonth
+            : cal.date(byAdding: .month, value: -1, to: resetThisMonth)
+    }
+
     /// Current window shifted back by one period, for week-over-week deltas;
-    /// nil for .all and .custom (no delta badge).
+    /// nil for .all, .custom and .cycle (no delta badge).
     private var previousPeriodWindow: Range<Date>? {
         let cal = Calendar.current
         let now = Date()
         switch dateFilter {
-        case .all, .custom:
+        case .all, .custom, .cycle:
             return nil
         case .today:
             let yStart = cal.startOfDay(for: cal.date(byAdding: .day, value: -1, to: now)!)
