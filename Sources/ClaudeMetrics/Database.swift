@@ -42,6 +42,16 @@ final class ArgusDB {
         sqlite3_exec(db, "ALTER TABLE sessions ADD COLUMN cwd TEXT DEFAULT ''", nil, nil, nil)
         sqlite3_exec(db, "ALTER TABLE messages ADD COLUMN ai_lines INTEGER DEFAULT 0", nil, nil, nil)
         sqlite3_exec(db, "ALTER TABLE messages ADD COLUMN request_id TEXT NOT NULL DEFAULT ''", nil, nil, nil)
+        // Migration: tag every message with its ingestion source (claude_code | cowork).
+        // Existing rows all came from ~/.claude/projects, so the default is correct.
+        // Index created here (not in the schema string) so it runs after the ALTER on old DBs.
+        sqlite3_exec(db, "ALTER TABLE messages ADD COLUMN source TEXT NOT NULL DEFAULT 'claude_code'", nil, nil, nil)
+        sqlite3_exec(db, "CREATE INDEX IF NOT EXISTS idx_msg_day_source ON messages(day, source)", nil, nil, nil)
+        // Migration: track 1-hour ephemeral cache writes separately — they cost 2× input
+        // vs 1.25× for the 5-minute tier (cache_create_tokens stays the total of both).
+        sqlite3_exec(db, "ALTER TABLE messages ADD COLUMN cache_create_1h_tokens INTEGER DEFAULT 0", nil, nil, nil)
+        // Index for the request-level dedup (lookups/updates by request_id during ingest + backfill)
+        sqlite3_exec(db, "CREATE INDEX IF NOT EXISTS idx_msg_request ON messages(request_id)", nil, nil, nil)
         // One-time: remove duplicate rows caused by Claude Code writing the same requestId twice.
         // Uses (session_id, timestamp) to identify duplicates because request_id is empty on
         // existing rows (the column was just added). Future ingestions skip duplicates via
@@ -95,12 +105,14 @@ final class ArgusDB {
             output_tokens     INTEGER DEFAULT 0,
             cache_read_tokens INTEGER DEFAULT 0,
             cache_create_tokens INTEGER DEFAULT 0,
+            cache_create_1h_tokens INTEGER DEFAULT 0,
             web_searches      INTEGER DEFAULT 0,
             cost_usd          REAL    DEFAULT 0,
             project           TEXT NOT NULL DEFAULT 'unknown',
             is_subagent       INTEGER DEFAULT 0,
             ai_lines          INTEGER DEFAULT 0,
             request_id        TEXT NOT NULL DEFAULT '',
+            source            TEXT NOT NULL DEFAULT 'claude_code',
             PRIMARY KEY (file_path, line_num)
         );
         CREATE TABLE IF NOT EXISTS git_stats_cache (
@@ -133,6 +145,8 @@ final class ArgusDB {
         CREATE INDEX IF NOT EXISTS idx_msg_model   ON messages(model);
         CREATE INDEX IF NOT EXISTS idx_msg_project ON messages(project);
         CREATE INDEX IF NOT EXISTS idx_msg_session ON messages(session_id);
+        CREATE INDEX IF NOT EXISTS idx_msg_day_hour ON messages(day, hour);
+        CREATE INDEX IF NOT EXISTS idx_msg_day_acct ON messages(day, account_uuid);
         CREATE INDEX IF NOT EXISTS idx_tool_day    ON tool_events(day);
         CREATE TABLE IF NOT EXISTS user_turns (
             file_path  TEXT NOT NULL,
@@ -209,18 +223,25 @@ final class ArgusDB {
 
     var accountFilter: String?
     var projectFilter: String?
+    var sourceFilter: String?
 
-    // SQL fragments appended to WHERE — safe: values come from our own DB, not user input
+    // SQL fragments appended to WHERE. Values come from our own DB, but project names
+    // derive from directory names — escape quotes so an apostrophe can't break the query.
+    private func sqlQuote(_ value: String) -> String {
+        value.replacingOccurrences(of: "'", with: "''")
+    }
     private var af: String {
         var parts: [String] = []
-        if let f = accountFilter { parts.append("AND account_uuid = '\(f)'") }
-        if let p = projectFilter { parts.append("AND project = '\(p)'") }
+        if let f = accountFilter { parts.append("AND account_uuid = '\(sqlQuote(f))'") }
+        if let p = projectFilter { parts.append("AND project = '\(sqlQuote(p))'") }
+        if let s = sourceFilter  { parts.append("AND source = '\(sqlQuote(s))'") }
         return parts.joined(separator: " ")
     }
     private func af(_ alias: String) -> String {
         var parts: [String] = []
-        if let f = accountFilter { parts.append("AND \(alias).account_uuid = '\(f)'") }
-        if let p = projectFilter { parts.append("AND \(alias).project = '\(p)'") }
+        if let f = accountFilter { parts.append("AND \(alias).account_uuid = '\(sqlQuote(f))'") }
+        if let p = projectFilter { parts.append("AND \(alias).project = '\(sqlQuote(p))'") }
+        if let s = sourceFilter  { parts.append("AND \(alias).source = '\(sqlQuote(s))'") }
         return parts.joined(separator: " ")
     }
 
@@ -255,7 +276,62 @@ final class ArgusDB {
 
     // MARK: - Ingestion
 
-    func ingestFiles(_ files: [(url: URL, isSubagent: Bool)], account: AccountInfo?) throws {
+    /// Counters for data silently skipped during an ingest run. Surfaced in the UI
+    /// so partial ingestion (corrupt files, malformed lines) is visible to the user.
+    struct IngestReport {
+        var unreadableFiles = 0
+        var malformedLines = 0
+        var isEmpty: Bool { unreadableFiles == 0 && malformedLines == 0 }
+    }
+
+    /// Web searches + AI-written lines from a message's content blocks.
+    /// server_tool_use.web_search_requests is always 0 in Claude Code JSONL; actual
+    /// searches are tool_use blocks named "WebSearch". AI lines come from
+    /// Write/Edit/MultiEdit payloads and Bash heredocs.
+    private func contentMetrics(_ contentBlocks: [[String: Any]]) -> (webSearches: Int, aiLines: Int) {
+        let ws = contentBlocks.filter {
+            $0["type"] as? String == "tool_use" && $0["name"] as? String == "WebSearch"
+        }.count
+        let aiLines = contentBlocks.reduce(0) { sum, block -> Int in
+            guard block["type"] as? String == "tool_use",
+                  let name = block["name"] as? String,
+                  let input = block["input"] as? [String: Any] else { return sum }
+            switch name {
+            case "Write":
+                return sum + (input["content"] as? String ?? "").components(separatedBy: "\n").count
+            case "Edit":
+                return sum + (input["new_string"] as? String ?? "").components(separatedBy: "\n").count
+            case "MultiEdit":
+                let edits = input["edits"] as? [[String: Any]] ?? []
+                return sum + edits.reduce(0) {
+                    $0 + (($1["new_string"] as? String ?? "").components(separatedBy: "\n").count)
+                }
+            case "Bash":
+                // Count lines inside heredoc blocks (most common pattern for large file writes via Bash)
+                return sum + bashHeredocLineCount(input["command"] as? String ?? "")
+            default: return sum
+            }
+        }
+        return (ws, aiLines)
+    }
+
+    /// All requestIds already in the DB, with the row that owns each one.
+    /// Used by the global dedup: a request seen again in the same file is a
+    /// cumulative streaming update; in a different file it's a literal copy.
+    private func loadSeenRequests() -> [String: (filePath: String, lineNum: Int)] {
+        var result: [String: (filePath: String, lineNum: Int)] = [:]
+        guard let q = try? prepare(
+            "SELECT request_id, file_path, line_num FROM messages WHERE request_id != ''") else { return result }
+        while sqlite3_step(q) == SQLITE_ROW {
+            result[colTxt(q, 0)] = (colTxt(q, 1), colInt(q, 2))
+        }
+        sqlite3_finalize(q)
+        return result
+    }
+
+    @discardableResult
+    func ingestFiles(_ files: [(url: URL, isSubagent: Bool, source: String)], account: AccountInfo?) throws -> IngestReport {
+        var report = IngestReport()
         // Load already-processed line counts
         var linesProcessed: [String: Int] = [:]
         do {
@@ -289,8 +365,9 @@ final class ArgusDB {
             INSERT OR REPLACE INTO messages
             (file_path,line_num,session_id,timestamp,day,hour,model,
              input_tokens,output_tokens,cache_read_tokens,cache_create_tokens,
-             web_searches,cost_usd,project,is_subagent,account_uuid,ai_lines,request_id)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+             web_searches,cost_usd,project,is_subagent,account_uuid,ai_lines,request_id,source,
+             cache_create_1h_tokens)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """)
         let toolInsert = try prepare(
             "INSERT OR IGNORE INTO tool_events(file_path,line_num,session_id,day,count) VALUES(?,?,?,?,?)")
@@ -298,13 +375,30 @@ final class ArgusDB {
             "INSERT OR REPLACE INTO ingested_files(path,lines_processed) VALUES(?,?)")
         let utInsert = try prepare(
             "INSERT OR IGNORE INTO user_turns(file_path,line_num,session_id,timestamp,day) VALUES(?,?,?,?,?)")
+        // Cumulative streaming update: a later line of the same request supersedes the
+        // token counts (usage is cumulative) and adds its own content blocks (ws/ai_lines)
+        let dupUpdate = try prepare("""
+            UPDATE messages SET
+                input_tokens = ?, output_tokens = ?, cache_read_tokens = ?,
+                cache_create_tokens = ?, cache_create_1h_tokens = ?,
+                web_searches = web_searches + ?, ai_lines = ai_lines + ?, cost_usd = ?
+            WHERE file_path = ? AND line_num = ?
+            """)
 
-        for (fileURL, isSubagent) in files {
+        // Global request dedup (lazy: loaded only when a file actually has new lines).
+        // Same requestId in the same file = cumulative streaming write (last-wins);
+        // in a different file = literal copy (e.g. compaction agent transcripts) → skip.
+        var seenRequests: [String: (filePath: String, lineNum: Int)]? = nil
+
+        for (fileURL, isSubagent, source) in files {
             let path = fileURL.path
             let startLine = linesProcessed[path] ?? 0
 
             guard let data = try? Data(contentsOf: fileURL),
-                  let text = String(data: data, encoding: .utf8) else { continue }
+                  let text = String(data: data, encoding: .utf8) else {
+                report.unreadableFiles += 1
+                continue
+            }
 
             let allLines = text.split(separator: "\n", omittingEmptySubsequences: true)
             guard allLines.count > startLine else { continue }
@@ -320,9 +414,11 @@ final class ArgusDB {
                 newCwds[sid] = cwd
             }
 
-            // Insert newly-discovered sessions
+            // Insert newly-discovered sessions.
+            // Cowork sessions run in a sandbox whose cwd/path slug is meaningless —
+            // group them all under a single "Cowork" project.
             for (sid, cwd) in newCwds {
-                let proj = resolvedProject(cwd: cwd, fileURL: fileURL)
+                let proj = source == "cowork" ? "Cowork" : resolvedProject(cwd: cwd, fileURL: fileURL)
                 bindTxt(sessInsert, 1, sid)
                 bindTxt(sessInsert, 2, proj)
                 bindInt(sessInsert, 3, isSubagent ? 1 : 0)
@@ -333,22 +429,14 @@ final class ArgusDB {
             }
 
             // Pass 2: insert messages and tool events
-            // Track requestIds seen in this batch to skip Claude Code's duplicate writes
-            // (same API call can appear on two consecutive JSONL lines with different UUIDs)
-            var seenRequestIds = Set<String>()
-            // Pre-load requestIds already in DB for this file to prevent cross-run duplicates
-            let rq = try? prepare("SELECT request_id FROM messages WHERE file_path = ? AND request_id != ''")
-            if let rq = rq {
-                sqlite3_bind_text(rq, 1, (path as NSString).utf8String, -1, nil)
-                while sqlite3_step(rq) == SQLITE_ROW {
-                    if let cstr = sqlite3_column_text(rq, 0) { seenRequestIds.insert(String(cString: cstr)) }
-                }
-                sqlite3_finalize(rq)
-            }
+            if seenRequests == nil { seenRequests = loadSeenRequests() }
             var lineNum = startLine
             for line in newLines {
                 lineNum += 1
-                guard let obj = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any] else { continue }
+                guard let obj = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any] else {
+                    report.malformedLines += 1
+                    continue
+                }
 
                 let type = obj["type"] as? String ?? ""
                 let sid  = obj["sessionId"] as? String ?? ""
@@ -358,11 +446,10 @@ final class ArgusDB {
                 if type == "assistant", let msg = obj["message"] as? [String: Any] {
                     let reqId = obj["requestId"] as? String ?? ""
 
-                    // Skip duplicate: same Anthropic request already ingested from this file
-                    if !reqId.isEmpty {
-                        if seenRequestIds.contains(reqId) { continue }
-                        seenRequestIds.insert(reqId)
-                    }
+                    // Literal copy of a request already owned by ANOTHER file
+                    // (compaction agent transcripts) — skip before the heavy parse
+                    let keptRow = reqId.isEmpty ? nil : seenRequests?[reqId]
+                    if let kept = keptRow, kept.filePath != path { continue }
 
                     let model  = msg["model"] as? String ?? "unknown"
                     let usage  = msg["usage"] as? [String: Any] ?? [:]
@@ -370,43 +457,35 @@ final class ArgusDB {
                     let output = usage["output_tokens"]               as? Int ?? 0
                     let cr     = usage["cache_read_input_tokens"]     as? Int ?? 0
                     let cc     = usage["cache_creation_input_tokens"] as? Int ?? 0
-                    // server_tool_use.web_search_requests is always 0 in Claude Code JSONL;
-                    // actual web searches appear as tool_use blocks with name "WebSearch"
+                    // usage.cache_creation breaks the total down by TTL — the 1h tier costs 2× input
+                    let ccDetail = usage["cache_creation"] as? [String: Any] ?? [:]
+                    let cc1h   = min(cc, ccDetail["ephemeral_1h_input_tokens"] as? Int ?? 0)
                     let contentBlocks = msg["content"] as? [[String: Any]] ?? []
-                    let ws = contentBlocks.filter {
-                        $0["type"] as? String == "tool_use" && $0["name"] as? String == "WebSearch"
-                    }.count
-
-                    // Count AI-written lines from Write/Edit/MultiEdit tool_use blocks
-                    let aiLines = contentBlocks.reduce(0) { sum, block in
-                        guard block["type"] as? String == "tool_use",
-                              let name = block["name"] as? String,
-                              let input = block["input"] as? [String: Any] else { return sum }
-                        switch name {
-                        case "Write":
-                            let c = input["content"] as? String ?? ""
-                            return sum + c.components(separatedBy: "\n").count
-                        case "Edit":
-                            let ns = input["new_string"] as? String ?? ""
-                            return sum + ns.components(separatedBy: "\n").count
-                        case "MultiEdit":
-                            let edits = input["edits"] as? [[String: Any]] ?? []
-                            return sum + edits.reduce(0) { s, e in
-                                s + ((e["new_string"] as? String ?? "").components(separatedBy: "\n").count)
-                            }
-                        case "Bash":
-                            // Count lines inside heredoc blocks (most common pattern for large file writes via Bash)
-                            let cmd = input["command"] as? String ?? ""
-                            return sum + bashHeredocLineCount(cmd)
-                        default: return sum
-                        }
-                    }
+                    let (ws, aiLines) = contentMetrics(contentBlocks)
 
                     guard input + output + cr + cc > 0 else { continue }
 
+                    let cost = ModelPricingTable.price(for: model)
+                        .cost(input: input, output: output, cr: cr, cc5m: cc - cc1h, cc1h: cc1h)
+
+                    // Same request, same file: cumulative streaming write — update the
+                    // kept row with the latest (cumulative) usage, add this line's blocks.
+                    // timestamp/day/hour stay those of the first line.
+                    if let kept = keptRow {
+                        bindInt(dupUpdate, 1, input);  bindInt(dupUpdate, 2, output)
+                        bindInt(dupUpdate, 3, cr);     bindInt(dupUpdate, 4, cc)
+                        bindInt(dupUpdate, 5, cc1h);   bindInt(dupUpdate, 6, ws)
+                        bindInt(dupUpdate, 7, aiLines); bindDbl(dupUpdate, 8, cost)
+                        bindTxt(dupUpdate, 9, kept.filePath)
+                        bindInt(dupUpdate, 10, kept.lineNum)
+                        sqlite3_step(dupUpdate)
+                        sqlite3_reset(dupUpdate)
+                        continue
+                    }
+
                     let hour = parseDate(ts).map { cal.component(.hour, from: $0) } ?? 0
-                    let proj = sessionProjects[sid] ?? resolvedProject(cwd: nil, fileURL: fileURL)
-                    let cost = ModelPricingTable.price(for: model).cost(input: input, output: output, cr: cr, cc: cc)
+                    let proj = sessionProjects[sid]
+                        ?? (source == "cowork" ? "Cowork" : resolvedProject(cwd: nil, fileURL: fileURL))
 
                     bindTxt(msgInsert,  1, path);   bindInt(msgInsert,  2, lineNum)
                     bindTxt(msgInsert,  3, sid);    bindTxt(msgInsert,  4, ts)
@@ -420,8 +499,13 @@ final class ArgusDB {
                     else { sqlite3_bind_null(msgInsert, 16) }
                     bindInt(msgInsert, 17, aiLines)
                     bindTxt(msgInsert, 18, reqId)
+                    bindTxt(msgInsert, 19, source)
+                    bindInt(msgInsert, 20, cc1h)
                     sqlite3_step(msgInsert)
                     sqlite3_reset(msgInsert)
+                    // Register only after the >0 guard: a zero-usage first line must not
+                    // shadow the real row of the same request
+                    if !reqId.isEmpty { seenRequests?[reqId] = (path, lineNum) }
                 }
 
                 if type == "user", let msg = obj["message"] as? [String: Any], !day.isEmpty {
@@ -455,8 +539,10 @@ final class ArgusDB {
         sqlite3_finalize(toolInsert)
         sqlite3_finalize(fileUpsert)
         sqlite3_finalize(utInsert)
+        sqlite3_finalize(dupUpdate)
 
         try execSQL("COMMIT")
+        return report
     }
 
     // MARK: - Feedback ingestion
@@ -505,6 +591,8 @@ final class ArgusDB {
         let dailyAccountCosts    = try queryDailyAccountCosts()
         let dailyHourCosts       = try queryDailyHourCosts()
         let latestTs             = try queryLatestMessageTimestamp()
+        let dailySourceCosts     = try queryDailySourceCosts()
+        let knownSources         = try queryKnownSources()
 
         let dailyCosts = Dictionary(uniqueKeysWithValues: dailyTotals.map { ($0.date, $0.estimatedCostUSD) })
 
@@ -539,7 +627,9 @@ final class ArgusDB {
             dailyAvgResponseTimeSec: dailyAvgResponseTime.isEmpty ? nil : dailyAvgResponseTime,
             dailyAccountCosts: dailyAccountCosts.isEmpty ? nil : dailyAccountCosts,
             dailyHourCosts: dailyHourCosts.isEmpty ? nil : dailyHourCosts,
-            latestMessageTimestamp: latestTs
+            latestMessageTimestamp: latestTs,
+            dailySourceCosts: dailySourceCosts.isEmpty ? nil : dailySourceCosts,
+            knownSourcesList: knownSources.isEmpty ? nil : knownSources
         )
     }
 
@@ -549,14 +639,15 @@ final class ArgusDB {
         let stmt = try prepare("""
             SELECT day, model,
                 SUM(input_tokens), SUM(output_tokens),
-                SUM(cache_read_tokens), SUM(cache_create_tokens), SUM(web_searches)
+                SUM(cache_read_tokens), SUM(cache_create_tokens), SUM(web_searches),
+                SUM(cache_create_1h_tokens)
             FROM messages WHERE day != '' \(af)
             GROUP BY day, model ORDER BY day
         """)
-        var byDay: [String: [String: (Int, Int, Int, Int, Int)]] = [:]
+        var byDay: [String: [String: (Int, Int, Int, Int, Int, Int)]] = [:]
         while sqlite3_step(stmt) == SQLITE_ROW {
             let day = colTxt(stmt, 0); let model = colTxt(stmt, 1)
-            byDay[day, default: [:]][model] = (colInt(stmt,2), colInt(stmt,3), colInt(stmt,4), colInt(stmt,5), colInt(stmt,6))
+            byDay[day, default: [:]][model] = (colInt(stmt,2), colInt(stmt,3), colInt(stmt,4), colInt(stmt,5), colInt(stmt,6), colInt(stmt,7))
         }
         sqlite3_finalize(stmt)
 
@@ -577,7 +668,9 @@ final class ArgusDB {
             let totCC  = modelMap.values.reduce(0) { $0 + $1.3 }
             let totWS  = modelMap.values.reduce(0) { $0 + $1.4 }
             let cost   = modelMap.reduce(0.0) { s, p in
-                s + ModelPricingTable.price(for: p.key).cost(input: p.value.0, output: p.value.1, cr: p.value.2, cc: p.value.3)
+                s + ModelPricingTable.price(for: p.key)
+                    .cost(input: p.value.0, output: p.value.1, cr: p.value.2,
+                          cc5m: p.value.3 - p.value.5, cc1h: p.value.5)
             }
             let savings = modelMap.reduce(0.0) { s, p in
                 let pr = ModelPricingTable.price(for: p.key)
@@ -830,10 +923,10 @@ final class ArgusDB {
     /// export panel's own selectors are independent of the sidebar's live filters.
     func queryFilteredSessions(account: String?, project: String?, startDay: String?, endDay: String?) throws -> [SessionSummary] {
         var clauses: [String] = ["m.day != ''"]
-        if let a = account, !a.isEmpty { clauses.append("m.account_uuid = '\(a)'") }
-        if let p = project, !p.isEmpty { clauses.append("m.project = '\(p)'") }
-        if let s = startDay, !s.isEmpty { clauses.append("m.day >= '\(s)'") }
-        if let e = endDay,   !e.isEmpty { clauses.append("m.day <= '\(e)'") }
+        if let a = account, !a.isEmpty { clauses.append("m.account_uuid = '\(sqlQuote(a))'") }
+        if let p = project, !p.isEmpty { clauses.append("m.project = '\(sqlQuote(p))'") }
+        if let s = startDay, !s.isEmpty { clauses.append("m.day >= '\(sqlQuote(s))'") }
+        if let e = endDay,   !e.isEmpty { clauses.append("m.day <= '\(sqlQuote(e))'") }
         let where_ = clauses.joined(separator: " AND ")
         let stmt = try prepare("""
             SELECT m.session_id, m.project, MIN(m.day), COUNT(*),
@@ -962,6 +1055,42 @@ final class ArgusDB {
         }
     }
 
+    private func queryDailySourceCosts() throws -> [DailySourceCosts] {
+        let stmt = try prepare("""
+            SELECT day, source, SUM(cost_usd), COUNT(*)
+            FROM messages
+            WHERE day != '' \(af)
+            GROUP BY day, source
+            ORDER BY day
+        """)
+        defer { sqlite3_finalize(stmt) }
+        var byCosts: [String: [String: Double]] = [:]
+        var byMsgs:  [String: [String: Int]]    = [:]
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            let day = colTxt(stmt, 0)
+            let src = colTxt(stmt, 1)
+            byCosts[day, default: [:]][src] = colDbl(stmt, 2)
+            byMsgs[day,  default: [:]][src] = colInt(stmt, 3)
+        }
+        return byCosts.keys.sorted().map {
+            DailySourceCosts(date: $0, costs: byCosts[$0]!, messages: byMsgs[$0] ?? [:])
+        }
+    }
+
+    func queryKnownSources() throws -> [String] {
+        // Use account filter only (not source filter) so the picker always shows all sources
+        let accountClause = accountFilter.map { "AND account_uuid = '\(sqlQuote($0))'" } ?? ""
+        let stmt = try prepare("""
+            SELECT DISTINCT source FROM messages
+            WHERE source IS NOT NULL AND source != '' \(accountClause)
+            ORDER BY source
+        """)
+        defer { sqlite3_finalize(stmt) }
+        var result: [String] = []
+        while sqlite3_step(stmt) == SQLITE_ROW { result.append(colTxt(stmt, 0)) }
+        return result
+    }
+
     private func queryDailyAvgResponseTime() throws -> [String: Double] {
         let stmt = try prepare("""
             SELECT m.day,
@@ -1018,7 +1147,7 @@ final class ArgusDB {
 
     func queryKnownProjects() throws -> [String] {
         // Use account filter only (not project filter) so the picker always shows all projects
-        let accountClause = accountFilter.map { "AND account_uuid = '\($0)'" } ?? ""
+        let accountClause = accountFilter.map { "AND account_uuid = '\(sqlQuote($0))'" } ?? ""
         let stmt = try prepare("""
             SELECT DISTINCT project FROM messages
             WHERE project IS NOT NULL AND project != '' \(accountClause)
@@ -1080,30 +1209,158 @@ final class ArgusDB {
                       obj["type"] as? String == "assistant",
                       let msg = obj["message"] as? [String: Any],
                       let content = msg["content"] as? [[String: Any]] else { continue }
-                let ai = content.reduce(0) { sum, block -> Int in
-                    guard block["type"] as? String == "tool_use",
-                          let name  = block["name"]  as? String,
-                          let input = block["input"] as? [String: Any] else { return sum }
-                    switch name {
-                    case "Write":
-                        return sum + (input["content"] as? String ?? "").components(separatedBy: "\n").count
-                    case "Edit":
-                        return sum + (input["new_string"] as? String ?? "").components(separatedBy: "\n").count
-                    case "MultiEdit":
-                        let edits = input["edits"] as? [[String: Any]] ?? []
-                        return sum + edits.reduce(0) {
-                            $0 + (($1["new_string"] as? String ?? "").components(separatedBy: "\n").count)
-                        }
-                    case "Bash":
-                        return sum + bashHeredocLineCount(input["command"] as? String ?? "")
-                    default: return sum
-                    }
-                }
+                let ai = contentMetrics(content).aiLines
                 guard ai > 0 else { continue }
                 bindInt(upd, 1, ai); bindTxt(upd, 2, path); bindInt(upd, 3, i + 1)
                 sqlite3_step(upd); sqlite3_reset(upd)
             }
         }
+        try execSQL("COMMIT")
+    }
+
+    // One-shot after a pricing-table change: re-read the JSONLs to populate
+    // cache_create_1h_tokens on historical rows, then recompute cost_usd for every
+    // message with the current ModelPricingTable. Guarded by UserDefaults in MetricsStore.
+    func backfillCacheTiersAndRecomputeCosts() throws {
+        var paths: [String] = []
+        let s = try prepare("SELECT path FROM ingested_files")
+        while sqlite3_step(s) == SQLITE_ROW { paths.append(colTxt(s, 0)) }
+        sqlite3_finalize(s)
+
+        try execSQL("BEGIN")
+
+        // Pass 1: populate cache_create_1h_tokens from usage.cache_creation
+        let upd = try prepare("""
+            UPDATE messages SET cache_create_1h_tokens = ?
+            WHERE file_path = ? AND line_num = ? AND cache_create_1h_tokens = 0
+            """)
+        for path in paths {
+            guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+                  let text = String(data: data, encoding: .utf8) else { continue }
+            let lines = text.split(separator: "\n", omittingEmptySubsequences: true)
+            for (i, line) in lines.enumerated() {
+                guard let obj = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+                      obj["type"] as? String == "assistant",
+                      let msg = obj["message"] as? [String: Any],
+                      let usage = msg["usage"] as? [String: Any],
+                      let detail = usage["cache_creation"] as? [String: Any],
+                      let cc1h = detail["ephemeral_1h_input_tokens"] as? Int, cc1h > 0 else { continue }
+                bindInt(upd, 1, cc1h); bindTxt(upd, 2, path); bindInt(upd, 3, i + 1)
+                sqlite3_step(upd); sqlite3_reset(upd)
+            }
+        }
+        sqlite3_finalize(upd)
+
+        // Pass 2: recompute cost_usd for every row with the current price table
+        var rows: [(rowid: Int, model: String, inp: Int, out: Int, cr: Int, cc: Int, cc1h: Int)] = []
+        let q = try prepare("""
+            SELECT rowid, model, input_tokens, output_tokens,
+                   cache_read_tokens, cache_create_tokens, cache_create_1h_tokens
+            FROM messages
+            """)
+        while sqlite3_step(q) == SQLITE_ROW {
+            rows.append((colInt(q,0), colTxt(q,1), colInt(q,2), colInt(q,3), colInt(q,4), colInt(q,5), colInt(q,6)))
+        }
+        sqlite3_finalize(q)
+
+        let costUpd = try prepare("UPDATE messages SET cost_usd = ? WHERE rowid = ?")
+        defer { sqlite3_finalize(costUpd) }
+        for r in rows {
+            let cc1h = min(r.cc, r.cc1h)
+            let cost = ModelPricingTable.price(for: r.model)
+                .cost(input: r.inp, output: r.out, cr: r.cr, cc5m: r.cc - cc1h, cc1h: cc1h)
+            bindDbl(costUpd, 1, cost); bindInt(costUpd, 2, r.rowid)
+            sqlite3_step(costUpd); sqlite3_reset(costUpd)
+        }
+
+        try execSQL("COMMIT")
+    }
+
+    // One-shot for the dedup semantics change (first-wins → last-wins, per-file → global):
+    // Pass A drops literal cross-file copies (compaction agent transcripts); Pass B re-reads
+    // the JSONLs and, for requests streamed across multiple lines, applies the final
+    // cumulative usage and the summed web_searches/ai_lines. Guarded in MetricsStore.
+    func backfillDedupFinalUsage() throws {
+        try execSQL("BEGIN")
+
+        // Pass A: a request must own exactly one row — keep the earliest (the original
+        // transcript), drop copies in other files. Same-file rows are already unique per
+        // request, so any rn > 1 here is a cross-file copy.
+        try execSQL("""
+            DELETE FROM messages WHERE rowid IN (
+                SELECT rowid FROM (
+                    SELECT rowid, ROW_NUMBER() OVER (
+                        PARTITION BY request_id ORDER BY timestamp, rowid
+                    ) AS rn
+                    FROM messages WHERE request_id != ''
+                ) WHERE rn > 1
+            )
+            """)
+
+        // Pass B: re-read the files; for requests with multiple usage-bearing lines,
+        // take the LAST line's (cumulative) usage and the group's summed ws/ai_lines
+        var paths: [String] = []
+        let s = try prepare("SELECT path FROM ingested_files")
+        while sqlite3_step(s) == SQLITE_ROW { paths.append(colTxt(s, 0)) }
+        sqlite3_finalize(s)
+
+        let upd = try prepare("""
+            UPDATE messages SET
+                input_tokens = ?, output_tokens = ?, cache_read_tokens = ?,
+                cache_create_tokens = ?, cache_create_1h_tokens = ?,
+                web_searches = ?, ai_lines = ?, cost_usd = ?
+            WHERE file_path = ? AND request_id = ?
+            """)
+        defer { sqlite3_finalize(upd) }
+
+        for path in paths {
+            guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+                  let text = String(data: data, encoding: .utf8) else { continue }
+
+            struct Group {
+                var lines = 0
+                var model = ""
+                var input = 0, output = 0, cr = 0, cc = 0, cc1h = 0
+                var ws = 0, aiLines = 0
+            }
+            var groups: [String: Group] = [:]
+
+            for line in text.split(separator: "\n", omittingEmptySubsequences: true) {
+                guard let obj = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+                      obj["type"] as? String == "assistant",
+                      let rid = obj["requestId"] as? String, !rid.isEmpty,
+                      let msg = obj["message"] as? [String: Any] else { continue }
+                let usage  = msg["usage"] as? [String: Any] ?? [:]
+                let input  = usage["input_tokens"]                as? Int ?? 0
+                let output = usage["output_tokens"]               as? Int ?? 0
+                let cr     = usage["cache_read_input_tokens"]     as? Int ?? 0
+                let cc     = usage["cache_creation_input_tokens"] as? Int ?? 0
+                guard input + output + cr + cc > 0 else { continue }
+                let ccDetail = usage["cache_creation"] as? [String: Any] ?? [:]
+                let cc1h = min(cc, ccDetail["ephemeral_1h_input_tokens"] as? Int ?? 0)
+                let metrics = contentMetrics(msg["content"] as? [[String: Any]] ?? [])
+
+                var g = groups[rid] ?? Group()
+                g.lines += 1
+                g.model = msg["model"] as? String ?? "unknown"
+                g.input = input; g.output = output; g.cr = cr; g.cc = cc; g.cc1h = cc1h
+                g.ws += metrics.webSearches
+                g.aiLines += metrics.aiLines
+                groups[rid] = g
+            }
+
+            for (rid, g) in groups where g.lines > 1 {
+                let cost = ModelPricingTable.price(for: g.model)
+                    .cost(input: g.input, output: g.output, cr: g.cr, cc5m: g.cc - g.cc1h, cc1h: g.cc1h)
+                bindInt(upd, 1, g.input);  bindInt(upd, 2, g.output)
+                bindInt(upd, 3, g.cr);     bindInt(upd, 4, g.cc)
+                bindInt(upd, 5, g.cc1h);   bindInt(upd, 6, g.ws)
+                bindInt(upd, 7, g.aiLines); bindDbl(upd, 8, cost)
+                bindTxt(upd, 9, path);     bindTxt(upd, 10, rid)
+                sqlite3_step(upd); sqlite3_reset(upd)
+            }
+        }
+
         try execSQL("COMMIT")
     }
 

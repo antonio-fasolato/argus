@@ -187,6 +187,14 @@ struct SidebarView: View {
                                 store.dateFilter = filter
                             }
                         }
+                        // Mirrors the desktop "$ of $200" counter window; shown only
+                        // when a reset day is configured in Settings → General
+                        if store.billingCycleResetDay != nil {
+                            SidebarFilterRow(icon: "creditcard", label: "Billing Cycle",
+                                             isSelected: store.dateFilter == .cycle) {
+                                store.dateFilter = .cycle
+                            }
+                        }
                     }
                     .padding(.horizontal, 8)
 
@@ -267,6 +275,24 @@ struct SidebarView: View {
                         .padding(.horizontal, 8)
                     }
 
+                    // Source filter (Claude Code vs Cowork)
+                    if store.knownSources.count > 1 {
+                        SidebarSectionLabel("SOURCE")
+                        VStack(spacing: 2) {
+                            SidebarFilterRow(icon: "square.stack.3d.up.fill", label: "All Sources",
+                                             isSelected: store.sourceFilter == nil) {
+                                store.sourceFilter = nil
+                            }
+                            ForEach(store.knownSources, id: \.self) { src in
+                                SidebarFilterRow(icon: sourceIconName(src), label: sourceDisplayName(src),
+                                                 isSelected: store.sourceFilter == src) {
+                                    store.sourceFilter = src
+                                }
+                            }
+                        }
+                        .padding(.horizontal, 8)
+                    }
+
                     // Project filter
                     if store.knownProjects.count > 1 {
                         SidebarSectionLabel("PROJECT")
@@ -304,6 +330,20 @@ struct SidebarView: View {
                     .padding(.top, 10)
                 }
 
+                if store.ingestSkippedLines > 0 || store.ingestUnreadableFiles > 0 {
+                    HStack(spacing: 6) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.system(size: 9))
+                            .foregroundStyle(Color.orange)
+                        Text(ingestWarningText)
+                            .font(.system(size: 10))
+                            .foregroundStyle(Color.appTextTertiary)
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.top, 6)
+                    .help("Some data could not be ingested — totals may be incomplete")
+                }
+
                 Button { store.loadData() } label: {
                     HStack(spacing: 7) {
                         Image(systemName: "arrow.clockwise")
@@ -320,6 +360,13 @@ struct SidebarView: View {
             }
         }
         .background(Color.appSidebar)
+    }
+
+    private var ingestWarningText: String {
+        var parts: [String] = []
+        if store.ingestSkippedLines > 0 { parts.append("\(store.ingestSkippedLines) skipped lines") }
+        if store.ingestUnreadableFiles > 0 { parts.append("\(store.ingestUnreadableFiles) unreadable files") }
+        return parts.joined(separator: " · ")
     }
 }
 

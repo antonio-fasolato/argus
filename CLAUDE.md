@@ -21,6 +21,14 @@ cp Sources/ClaudeMetrics/GoogleCredentials.swift.example \
 
 Build target is **macOS 26** (`-target arm64-apple-macosx26.0`). Required for Liquid Glass APIs (`glassEffect`).
 
+## Tests
+
+```bash
+bash Tests/run_tests.sh
+```
+
+Standalone harness (no SPM/XCTest): compiles `Models.swift` + `Theme.swift` + `Tests/main.swift` with `swiftc` and runs the binary (exit 1 on failure). Covers pure logic only: `ModelPricingTable` (cost math, lookup fallbacks, external overrides), `buildSessionsCSV`/`buildSessionsJSON`, formatters. Keep `Tests/main.swift` free of dependencies on other source files so it stays fast to compile.
+
 ## Release
 
 ```bash
@@ -64,14 +72,18 @@ bash release.sh 1.2.0   # oppure senza argomento: chiede la versione interattiva
 ## Data pipeline
 
 ```
-~/.claude/projects/**/*.jsonl  →  ArgusDB.ingestFiles()  →  ~/.claude/argusai.db  →  ArgusDB.buildStatsCache()  →  views
+~/.claude/projects/**/*.jsonl                                       ┐
+~/Library/Application Support/Claude/local-agent-mode-sessions/     ├→  ArgusDB.ingestFiles()  →  ~/.claude/argusai.db  →  ArgusDB.buildStatsCache()  →  views
+    <org>/<user>/local_*/.claude/projects/**/*.jsonl  (Cowork)      ┘
 ```
 
-- JSONL files are the source of truth (written by Claude Code, never modified by ArgusAI).
+- JSONL files are the source of truth (written by Claude Code / Cowork, never modified by ArgusAI).
+- **Sources**: every message carries `messages.source` (`claude_code` | `cowork`) derived from which root the file came from. Cowork = local agent-mode sessions of the Claude desktop app — same JSONL format as Claude Code. All Cowork sessions are grouped under a single project named **"Cowork"** (their cwd is a meaningless sandbox path). Cowork discovery uses a targeted walk (`org → user → local_* → .claude/projects`) in `MetricsStore.coworkJSONLFiles()` — never enumerate the whole `local-agent-mode-sessions` tree (sibling dirs hold plugin caches and outputs). **Caveat**: Cowork sessions that run on claude.ai cloud infrastructure leave no local JSONL and cannot be tracked.
 - `ArgusDB` tracks `lines_processed` per file in the `ingested_files` table — only new lines are read on each 3s refresh.
+- `ingestFiles()` returns an `IngestReport` (unreadable files + malformed lines skipped); `MetricsStore` accumulates the counters (`ingestSkippedLines`/`ingestUnreadableFiles`) and the sidebar footer shows an orange warning when > 0.
 - All KPI queries run as SQL against indexed tables; **never re-parse JSONL in Swift**.
 - Ingestion uses `INSERT OR REPLACE` (not `INSERT OR IGNORE`) so that corrected fields (e.g. `web_searches`) are always up to date on re-ingest.
-- **Dedup**: Claude Code sometimes writes the same API response twice to the same JSONL (identical `requestId`, consecutive lines). `ingestFiles()` uses a `seenRequestIds: Set<String>` per file, pre-seeded from the DB, to skip duplicates across refresh cycles. A one-time migration (`argusai.dedupRequestIds.v1`) cleaned up historical duplicates using `(session_id, timestamp)`.
+- **Dedup**: Claude Code writes multiple `assistant` lines per `requestId` while streaming (one per content block) with **cumulative** usage — the last line has the final token counts. `ingestFiles()` keeps a **global** `seenRequests: [rid → (file, line)]` map (lazy pre-seed from DB): same rid in the same file → UPDATE the kept row with last-wins tokens and **additive** `web_searches`/`ai_lines`; same rid in a different file (compaction agent copies) → skip. The rid is registered only after the `usage > 0` guard, so a zero-usage first line can't shadow the real one. One-shots: `argusai.dedupRequestIds.v1` (legacy, by `(session_id, timestamp)`) and `argusai.dedupFinalUsage.v1` (drops cross-file copies, applies final cumulative usage).
 - **Cost estimation**: JSONL files do NOT contain a `costUSD` field. ArgusAI estimates costs using `ModelPricingTable` (public API prices). Actual billing may differ by ~10–15% due to plan pricing, billing cycle, or cache tier differences. An external override file `~/.claude/argus_pricing.json` can override per-model prices.
 
 ### Adding a new data point
@@ -86,7 +98,7 @@ bash release.sh 1.2.0   # oppure senza argomento: chiede la versione interattiva
 
 | Table | Key columns |
 |---|---|
-| `messages` | `(file_path, line_num)` PK · `session_id` · `day` · `hour` · `model` · `input/output/cr/cc/ws tokens` · `cost_usd` · `project` · `is_subagent` · `account_uuid` · `request_id` |
+| `messages` | `(file_path, line_num)` PK · `session_id` · `day` · `hour` · `model` · `input/output/cr/cc/ws tokens` · `cache_create_1h_tokens` (1h-TTL share of cc) · `cost_usd` · `project` · `is_subagent` · `account_uuid` · `request_id` · `source` (`claude_code`\|`cowork`) |
 | `sessions` | `session_id` PK · `project` · `is_subagent` |
 | `tool_events` | `(file_path, line_num)` PK · `session_id` · `day` · `count` |
 | `user_turns` | `(file_path, line_num)` PK · `session_id` · `timestamp` · `day` — human-typed messages, used for response time |
@@ -135,11 +147,23 @@ The sidebar "ACCOUNT" section is only shown when `knownAccounts.count > 1`.
 
 The sidebar "PROJECT" section is only shown when `knownProjects.count > 1`.
 
+### Source filter
+`MetricsStore.sourceFilter: String?` (nil = all) is set by the sidebar SOURCE picker — same mechanics as the project filter (`db.sourceFilter` → `AND source = '...'` via the `af` helpers; `queryKnownSources()` ignores the source filter so the picker always lists all sources). Display names/icons come from `sourceDisplayName()` / `sourceIconName()` in `Theme.swift`. The sidebar "SOURCE" section is only shown when `knownSources.count > 1`.
+
 ## Date filtering
 
-`MetricsStore.dateFilter: DateFilter` (`.today` / `.sevenDays` / `.thirtyDays` / `.all` / `.custom`) drives all views.
+`MetricsStore.dateFilter: DateFilter` (`.today` / `.sevenDays` / `.thirtyDays` / `.all` / `.custom` / `.cycle`) drives all views.
+
+`.cycle` mirrors the subscription billing window of the desktop "$ of $200" counter: `MetricsStore.billingCycleResetDay` (1–28, UserDefaults `argusai.billingCycleResetDay`, nil = off, set in Settings → General) → `billingCycleStart` computes the most recent reset day → `dateFilterWindow` returns `[start, ∞)`. The sidebar shows a "Billing Cycle" row only when a reset day is configured; no week-over-week delta (like `.custom`).
 
 **Pattern:** every KPI has a `filteredXxx` computed property in `MetricsStore` that slices the relevant `[DailyXxx]` array from `StatsCache` by date, then aggregates. Never read raw all-time stats directly in views; always use the `filtered*` variant.
+
+The date window logic is centralized in `MetricsStore`:
+- `dateFilterWindow: Range<Date>?` — half-open `[start, end)` window for the current filter (`nil` = `.all`, no filtering). The **only** place that switches on `dateFilter`.
+- `previousPeriodWindow: Range<Date>?` — same window shifted back one period for week-over-week deltas (`nil` for `.all`/`.custom`).
+- `slice(_:in:day:)` — filters an array by a "yyyy-MM-dd" key path; `slice(_:in:)` does the same for `[String: V]` dictionaries keyed by day.
+
+**When adding a new filter-aware property, do NOT write a `switch dateFilter` — call `slice(stats?.xxx ?? [], in: dateFilterWindow) { $0.date }`.**
 
 ### Custom date range
 `.custom` is set when the user picks dates via the "Da / Al" `DatePicker` rows in the sidebar. `MetricsStore` owns `customStartDate` and `customEndDate` (date-only, no time). All 11 filter switch statements handle `.custom` as `>= startOfDay(from) && < startOfDay(to+1)`. Week-over-week switches return `[]` for `.custom` (no delta badge). The segmented picker uses `DateFilter.presets` (not `allCases`) so `.custom` never appears as a segment.
@@ -160,10 +184,10 @@ The sidebar "PROJECT" section is only shown when `knownProjects.count > 1`.
 
 - **Never** use a segmented picker in the sidebar — use `SidebarFilterRow` rows (same visual language as nav items)
 - **Never** use `Color.appBorder.frame(height: 1)` as section separator — use `SidebarSectionLabel` + padding
-- All filter content (TIME RANGE, DAILY LIMIT, ACCOUNT, PROJECT) lives inside the `ScrollView` so it never overflows with many projects
+- All filter content (TIME RANGE, DAILY LIMIT, ACCOUNT, SOURCE, PROJECT) lives inside the `ScrollView` so it never overflows with many projects
 - New filter sections: add a `SidebarSectionLabel("MY SECTION")` + `VStack` of `SidebarFilterRow` buttons, padded `.horizontal, 8`
 
-When adding a new filter-aware property, add all **five** cases to the switch (`.today`, `.sevenDays`, `.thirtyDays`, `.all`, `.custom`). `.today` uses `Calendar.current.startOfDay(for: Date())` as cutoff; `.sevenDays` / `.thirtyDays` use `Calendar.current.date(byAdding: .day, value: -N, to: Date())`; `.custom` uses `customStartDate`/`customEndDate` from MetricsStore.
+When adding a new filter-aware property, use the `slice(_:in:day:)` + `dateFilterWindow` helpers in `MetricsStore` (see § Date filtering) — never duplicate the `switch dateFilter` logic.
 
 Key per-day structures stored in `StatsCache`:
 | Field | Used for |
@@ -211,6 +235,7 @@ Key per-day structures stored in `StatsCache`:
 | **Multi-account tracking** | `account_timeline` table + `messages.account_uuid`; `readCurrentAccount()` in `MetricsStore`; account chip in sidebar |
 | **Account filter** | `MetricsStore.accountFilter` → `ArgusDB.accountFilter` → SQL `AND account_uuid = '...'` on all queries; sidebar picker (hidden if single account) |
 | **Account cost breakdown** | `queryAccountCosts()` → `StatsCache.accountCosts`; multi-segment bar in `OverviewView` "By Account" card |
+| **Source tracking (Cowork)** | `messages.source` column; `queryDailySourceCosts()` → `StatsCache.dailySourceCosts` → `MetricsStore.filteredSourceCosts`; "By Source" card in `OverviewView` (shown when >1 source); sidebar SOURCE filter |
 | **Filtered Cost per User** | `MetricsStore.filteredAccountCosts` — aggregates `DailyAccountCosts` by date range; shows cost + message count per account |
 | **Best Streak** | `longestStreak` in `MetricsStore` — longest ever consecutive-day run; shown as "Best Streak" card (trophy) in `ActivityView` |
 | **Output/Context Ratio** | `filteredEfficiencyTrend` in `MetricsStore` — daily ratio of output tokens to total context tokens; line+area chart in `ActivityView` |
@@ -218,6 +243,7 @@ Key per-day structures stored in `StatsCache`:
 | **Chart tooltips** | `chartXSelection` + overlay on `ActivityBarChart` (date → msg count) and `HourlyBarChart` (hour → msg count) |
 | **Sortable Projects table** | `ProjectSortKey` enum + `sorted` computed var in `ProjectTable`; click any column header (PROJECT/MSG/OUTPUT/COST/WEB/% AI) to sort |
 | **Custom date range** | "Da / Al" `DatePicker` rows in sidebar (indented under "Custom" `SidebarFilterRow`); selecting a date activates `.custom` filter; clicking a preset deactivates it |
+| **Billing Cycle preset** | `DateFilter.cycle` + `billingCycleResetDay` (Settings → General, 1–28) → "Billing Cycle" row in sidebar TIME RANGE; window = most recent reset day → today, mirrors the desktop "$ of $200" counter |
 | **Chart crosshair** | `ChartCrosshair` helper in `Components.swift` — vertical + horizontal dashed lines, intersection dot, floating tooltip; applied to all line charts (Daily Messages, Daily Cost, Daily Cost Trend, Output/Context Ratio, Token Trend) |
 | **Click-to-explain** | `DailyCostExplainView` popover in `OverviewView.swift`; clicking the Daily Cost chart opens a breakdown by model + project, raw SQL, copy button |
 | **Session detail view** | Click any row in Sessions tab → `SessionDetailView` sheet; per-message breakdown (time, model, all token types, cost, ai_lines); footer row with session totals; data from `ArgusDB.querySessionMessages(sessionId:)` |
@@ -255,11 +281,15 @@ Silent refresh never shows the loading spinner; only the very first load does.
 ## Pricing
 
 `ModelPricingTable` in `Models.swift` maps model IDs to per-MTok prices.  
-Use `ModelPricingTable.price(for: model).cost(input:output:cr:cc:)` for cost computation.
+Use `ModelPricingTable.price(for: model).cost(input:output:cr:cc5m:cc1h:)` for cost computation — the 4-arg `cost(input:output:cr:cc:)` overload prices everything at the 5-minute cache-write rate and exists for legacy callers/tests.
 
-`externalOverrides` is loaded once at startup from `~/.claude/argus_pricing.json` (if present). Format:
+**Cache write tiers**: 5-minute ephemeral = 1.25× input (`cacheWritePerMTok`); 1-hour ephemeral = 2× input (computed via `effectiveCacheWrite1hPerMTok`, overridable with the optional `cacheWrite1hPerMTok`). Cowork uses 1h caching ~100% of the time, Claude Code ~90% — ingestion reads `usage.cache_creation.ephemeral_1h_input_tokens` into `messages.cache_create_1h_tokens` (`cache_create_tokens` stays the total of both tiers).
+
+**When updating prices**: messages store `cost_usd` at ingest time, and `queryDailyBreakdown` recomputes from tokens — after a table change, historical rows need `ArgusDB.backfillCacheTiersAndRecomputeCosts()` (one-shot, guarded by `argusai.pricingRecompute.v1` in UserDefaults; the flag is set only on success so failures retry at next launch). Bump the key suffix to re-run it after a future price change.
+
+`externalOverrides` is loaded once at startup from `~/.claude/argus_pricing.json` (if present). Format (`cacheWrite1hPerMTok` optional, defaults to 2× input):
 ```json
-{ "claude-sonnet-4-6": { "inputPerMTok": 3.0, "outputPerMTok": 15.0, "cacheReadPerMTok": 0.30, "cacheWritePerMTok": 3.75 } }
+{ "claude-sonnet-4-6": { "inputPerMTok": 3.0, "outputPerMTok": 15.0, "cacheReadPerMTok": 0.30, "cacheWritePerMTok": 3.75, "cacheWrite1hPerMTok": 6.0 } }
 ```
 
 **Note on accuracy**: JSONL files have no `costUSD` field — all costs are estimates from the price table. Actual billing can differ by ~10–15% (billing cycle mismatch, plan-specific rates, cache tier pricing). The Pricing tab in Settings shows this disclaimer to users.

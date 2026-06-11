@@ -96,6 +96,20 @@ struct DailyAccountCosts: Codable, Identifiable {
     let messages: [String: Int]     // accountUuid → message count
 }
 
+struct DailySourceCosts: Codable, Identifiable {
+    var id: String { date }
+    let date: String
+    let costs:    [String: Double]  // source ("claude_code" | "cowork") → cost
+    let messages: [String: Int]     // source → message count
+}
+
+struct SourceCostBreakdown: Identifiable {
+    var id: String { source }
+    let source: String
+    let costUSD: Double
+    let messageCount: Int
+}
+
 struct DailyTokenTotals: Codable, Identifiable {
     var id: String { date }
     let date: String
@@ -173,6 +187,8 @@ struct StatsCache: Codable {
     let dailyAccountCosts: [DailyAccountCosts]?
     let dailyHourCosts: [String: [String: Double]]?   // day → hour_str → cost_usd
     let latestMessageTimestamp: String?               // ISO8601 timestamp of most recent message
+    let dailySourceCosts: [DailySourceCosts]?         // per-day cost/messages by ingestion source
+    let knownSourcesList: [String]?                   // distinct sources seen in the DB
 }
 
 struct AccountInfo: Equatable, Codable, Identifiable {
@@ -229,7 +245,10 @@ struct ModelPricingTable {
         let inputPerMTok: Double
         let outputPerMTok: Double
         let cacheReadPerMTok: Double
-        let cacheWritePerMTok: Double
+        let cacheWritePerMTok: Double          // 5-minute ephemeral cache write (1.25× input)
+        var cacheWrite1hPerMTok: Double? = nil // 1-hour ephemeral cache write; nil = API rule (2× input)
+
+        var effectiveCacheWrite1hPerMTok: Double { cacheWrite1hPerMTok ?? inputPerMTok * 2.0 }
 
         func cost(for stats: ModelTokenStats) -> Double {
             Double(stats.inputTokens)                * inputPerMTok    / 1_000_000
@@ -244,14 +263,21 @@ struct ModelPricingTable {
             + Double(cr)   * cacheReadPerMTok  / 1_000_000
             + Double(cc)   * cacheWritePerMTok / 1_000_000
         }
+
+        func cost(input: Int, output: Int, cr: Int, cc5m: Int, cc1h: Int) -> Double {
+            cost(input: input, output: output, cr: cr, cc: cc5m)
+            + Double(cc1h) * effectiveCacheWrite1hPerMTok / 1_000_000
+        }
     }
 
     static let table: [String: Price] = [
-        "claude-opus-4-7":            Price(inputPerMTok: 15.0, outputPerMTok: 75.0, cacheReadPerMTok: 1.50,  cacheWritePerMTok: 18.75),
-        "claude-opus-4-6":            Price(inputPerMTok: 15.0, outputPerMTok: 75.0, cacheReadPerMTok: 1.50,  cacheWritePerMTok: 18.75),
+        "claude-fable-5":             Price(inputPerMTok: 10.0, outputPerMTok: 50.0, cacheReadPerMTok: 1.00,  cacheWritePerMTok: 12.50),
+        "claude-opus-4-8":            Price(inputPerMTok: 5.0,  outputPerMTok: 25.0, cacheReadPerMTok: 0.50,  cacheWritePerMTok: 6.25),
+        "claude-opus-4-7":            Price(inputPerMTok: 5.0,  outputPerMTok: 25.0, cacheReadPerMTok: 0.50,  cacheWritePerMTok: 6.25),
+        "claude-opus-4-6":            Price(inputPerMTok: 5.0,  outputPerMTok: 25.0, cacheReadPerMTok: 0.50,  cacheWritePerMTok: 6.25),
         "claude-sonnet-4-6":          Price(inputPerMTok: 3.0,  outputPerMTok: 15.0, cacheReadPerMTok: 0.30,  cacheWritePerMTok: 3.75),
         "claude-sonnet-4-5-20250929": Price(inputPerMTok: 3.0,  outputPerMTok: 15.0, cacheReadPerMTok: 0.30,  cacheWritePerMTok: 3.75),
-        "claude-haiku-4-5-20251001":  Price(inputPerMTok: 0.80, outputPerMTok: 4.0,  cacheReadPerMTok: 0.08,  cacheWritePerMTok: 1.0),
+        "claude-haiku-4-5-20251001":  Price(inputPerMTok: 1.0,  outputPerMTok: 5.0,  cacheReadPerMTok: 0.10,  cacheWritePerMTok: 1.25),
     ]
 
     // External overrides loaded once from ~/.claude/argus_pricing.json
@@ -267,7 +293,8 @@ struct ModelPricingTable {
             guard let i = d["inputPerMTok"], let o = d["outputPerMTok"],
                   let cr = d["cacheReadPerMTok"], let cw = d["cacheWritePerMTok"]
             else { continue }
-            result[model] = Price(inputPerMTok: i, outputPerMTok: o, cacheReadPerMTok: cr, cacheWritePerMTok: cw)
+            result[model] = Price(inputPerMTok: i, outputPerMTok: o, cacheReadPerMTok: cr,
+                                  cacheWritePerMTok: cw, cacheWrite1hPerMTok: d["cacheWrite1hPerMTok"])
         }
         return result
     }()
@@ -283,4 +310,34 @@ struct ModelPricingTable {
         }
         return Price(inputPerMTok: 3.0, outputPerMTok: 15.0, cacheReadPerMTok: 0.30, cacheWritePerMTok: 3.75)
     }
+}
+
+// MARK: - Export builders (pure functions, shared by legacy + filtered export; unit-tested in Tests/)
+
+func buildSessionsCSV(_ sessions: [SessionSummary]) -> String {
+    var csv = "session_id,project,date,messages,output_tokens,cost_usd,is_subagent,model\n"
+    for s in sessions {
+        let row = "\"\(s.sessionId)\",\"\(s.project)\",\(s.firstDay),\(s.messageCount),\(s.outputTokens),\(s.costUSD),\(s.isSubagent ? 1 : 0),\"\(s.topModel)\"\n"
+        csv += row
+    }
+    return csv
+}
+
+func buildSessionsJSON(_ sessions: [SessionSummary]) -> Data? {
+    struct SessionExport: Encodable {
+        let sessionId, project, firstDay, topModel: String
+        let messageCount, outputTokens: Int
+        let costUSD: Double
+        let isSubagent: Bool
+        let rating: Int?
+    }
+    let payload = sessions.map { s in
+        SessionExport(sessionId: s.sessionId, project: s.project, firstDay: s.firstDay,
+                      topModel: s.topModel, messageCount: s.messageCount,
+                      outputTokens: s.outputTokens, costUSD: s.costUSD,
+                      isSubagent: s.isSubagent, rating: s.rating)
+    }
+    let enc = JSONEncoder()
+    enc.outputFormatting = [.prettyPrinted, .sortedKeys]
+    return try? enc.encode(payload)
 }
