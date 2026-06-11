@@ -41,6 +41,10 @@ class MetricsStore: ObservableObject {
         didSet { if oldValue != projectFilter { loadData(silent: true) } }
     }
     @Published var knownProjects: [String] = []
+    @Published var sourceFilter: String? = nil {
+        didSet { if oldValue != sourceFilter { loadData(silent: true) } }
+    }
+    @Published var knownSources: [String] = []
     @Published var showingExport: Bool = false
     // Cumulative (per app session) counts of data skipped during ingestion —
     // shown as a warning in the sidebar footer so partial ingest isn't silent
@@ -62,6 +66,11 @@ class MetricsStore: ObservableObject {
 
     private let projectsURL = URL(fileURLWithPath: NSHomeDirectory())
         .appendingPathComponent(".claude/projects")
+
+    // Cowork (Claude desktop agent mode) keeps a Claude Code-compatible transcript per
+    // local session at <root>/<org>/<user>/local_<id>/.claude/projects/**/*.jsonl
+    private let coworkSessionsURL = URL(fileURLWithPath: NSHomeDirectory())
+        .appendingPathComponent("Library/Application Support/Claude/local-agent-mode-sessions")
 
     private var refreshTimer: Timer?
     private var lastParseDate: Date = .distantPast
@@ -135,12 +144,44 @@ class MetricsStore: ObservableObject {
     // MARK: - File discovery
 
     private func findJSONLFiles() -> [URL] {
+        claudeCodeJSONLFiles() + coworkJSONLFiles()
+    }
+
+    private func claudeCodeJSONLFiles() -> [URL] {
         guard let enumerator = FileManager.default.enumerator(
             at: projectsURL,
             includingPropertiesForKeys: [.contentModificationDateKey],
             options: [.skipsHiddenFiles]
         ) else { return [] }
         return enumerator.compactMap { $0 as? URL }.filter { $0.pathExtension == "jsonl" }
+    }
+
+    // Targeted walk (org → user → local_* → .claude/projects) instead of enumerating the
+    // whole local-agent-mode-sessions tree: sibling dirs hold plugin/skill caches and
+    // session outputs that would make the 3s mtime poll expensive.
+    private func coworkJSONLFiles() -> [URL] {
+        let fm = FileManager.default
+        guard let orgs = try? fm.contentsOfDirectory(at: coworkSessionsURL, includingPropertiesForKeys: nil) else { return [] }
+        var result: [URL] = []
+        for org in orgs {
+            guard let users = try? fm.contentsOfDirectory(at: org, includingPropertiesForKeys: nil) else { continue }
+            for user in users {
+                guard let locals = try? fm.contentsOfDirectory(at: user, includingPropertiesForKeys: nil) else { continue }
+                for local in locals where local.lastPathComponent.hasPrefix("local_") {
+                    let projects = local.appendingPathComponent(".claude/projects")
+                    guard let enumerator = fm.enumerator(
+                        at: projects,
+                        includingPropertiesForKeys: [.contentModificationDateKey]
+                    ) else { continue }
+                    result += enumerator.compactMap { $0 as? URL }.filter { $0.pathExtension == "jsonl" }
+                }
+            }
+        }
+        return result
+    }
+
+    private func sourceForFile(_ url: URL) -> String {
+        url.path.hasPrefix(coworkSessionsURL.path) ? "cowork" : "claude_code"
     }
 
     // MARK: - Account
@@ -243,7 +284,7 @@ class MetricsStore: ObservableObject {
         let currentFilter = accountFilter
         DispatchQueue.main.async { self.currentAccount = account }
         let files = findJSONLFiles().map { url in
-            (url: url, isSubagent: url.pathComponents.contains("subagents"))
+            (url: url, isSubagent: url.pathComponents.contains("subagents"), source: sourceForFile(url))
         }
         // One-shot: claim all historical NULL messages for the current account
         let claimKey = "argusai.historicalClaimDone"
@@ -268,14 +309,30 @@ class MetricsStore: ObservableObject {
             try? db.backfillAiLines()
             UserDefaults.standard.set(true, forKey: aiBackfillKey)
         }
+        // One-shot after the 2026-06 pricing-table update (fable-5, opus $5/$25,
+        // 1h cache tier): backfill cache_create_1h_tokens + recompute historical cost_usd
+        let pricingRecomputeKey = "argusai.pricingRecompute.v1"
+        if !UserDefaults.standard.bool(forKey: pricingRecomputeKey) {
+            do {
+                try db.backfillCacheTiersAndRecomputeCosts()
+                UserDefaults.standard.set(true, forKey: pricingRecomputeKey)
+            } catch {
+                // Flag stays unset so the recompute retries on next launch
+                NSLog("ArgusAI: pricing recompute failed — %@", "\(error)")
+            }
+        }
         db.accountFilter = currentFilter
         db.projectFilter = projectFilter
+        db.sourceFilter = sourceFilter
         let cache = try db.buildStatsCache()
         if let accounts = cache.knownAccountsList {
             DispatchQueue.main.async { self.knownAccounts = accounts }
         }
         if let projects = cache.knownProjectsList {
             DispatchQueue.main.async { self.knownProjects = projects }
+        }
+        if let sources = cache.knownSourcesList {
+            DispatchQueue.main.async { self.knownSources = sources }
         }
         return cache
     }
@@ -1113,6 +1170,24 @@ class MetricsStore: ObservableObject {
 
     private var filteredDailyAccountCosts: [DailyAccountCosts] {
         slice(stats?.dailyAccountCosts ?? [], in: dateFilterWindow) { $0.date }
+    }
+
+    private var filteredDailySourceCosts: [DailySourceCosts] {
+        slice(stats?.dailySourceCosts ?? [], in: dateFilterWindow) { $0.date }
+    }
+
+    var filteredSourceCosts: [SourceCostBreakdown] {
+        var totalCosts: [String: Double] = [:]
+        var totalMsgs:  [String: Int]    = [:]
+        for d in filteredDailySourceCosts {
+            for (src, cost) in d.costs { totalCosts[src, default: 0] += cost }
+            for (src, msgs) in d.messages { totalMsgs[src, default: 0] += msgs }
+        }
+        return totalCosts
+            .sorted { $0.value > $1.value }
+            .map { (src, cost) in
+                SourceCostBreakdown(source: src, costUSD: cost, messageCount: totalMsgs[src] ?? 0)
+            }
     }
 
     var filteredAccountCosts: [AccountCostBreakdown] {

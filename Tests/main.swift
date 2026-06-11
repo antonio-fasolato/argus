@@ -46,6 +46,20 @@ expectClose(sonnet.cost(input: 100_000, output: 50_000, cr: 1_000_000, cc: 200_0
             0.3 + 0.75 + 0.30 + 0.75, "mixed token cost")
 expectClose(sonnet.cost(input: 0, output: 0, cr: 0, cc: 0), 0, "zero tokens cost zero")
 
+// 1-hour cache tier: defaults to 2× input ($6/MTok for sonnet) vs 1.25× for 5m
+expectClose(sonnet.cost(input: 0, output: 0, cr: 0, cc5m: 0, cc1h: 1_000_000), 6.0,
+            "1M 1h cache-write tokens at 2x input price")
+expectClose(sonnet.cost(input: 0, output: 0, cr: 0, cc5m: 1_000_000, cc1h: 1_000_000),
+            3.75 + 6.0, "mixed 5m + 1h cache writes")
+expectClose(sonnet.cost(input: 100_000, output: 50_000, cr: 1_000_000, cc5m: 200_000, cc1h: 0),
+            sonnet.cost(input: 100_000, output: 50_000, cr: 1_000_000, cc: 200_000),
+            "zero 1h tokens matches the 4-arg overload")
+let custom1h = ModelPricingTable.Price(inputPerMTok: 3.0, outputPerMTok: 15.0,
+                                       cacheReadPerMTok: 0.30, cacheWritePerMTok: 3.75,
+                                       cacheWrite1hPerMTok: 9.0)
+expectClose(custom1h.cost(input: 0, output: 0, cr: 0, cc5m: 0, cc1h: 1_000_000), 9.0,
+            "explicit cacheWrite1hPerMTok overrides the 2x default")
+
 let bigStats = ModelTokenStats(inputTokens: 1_000_000_000, outputTokens: 1_000_000_000,
                                cacheReadInputTokens: 1_000_000_000,
                                cacheCreationInputTokens: 1_000_000_000,
@@ -67,8 +81,17 @@ ModelPricingTable.externalOverrides = [:]
 let exact = ModelPricingTable.price(for: "claude-sonnet-4-6")
 expectClose(exact.inputPerMTok, 3.0, "exact table match: sonnet input price")
 
+let fable = ModelPricingTable.price(for: "claude-fable-5")
+expectClose(fable.inputPerMTok, 10.0, "fable-5 input price")
+expectClose(fable.outputPerMTok, 50.0, "fable-5 output price")
+expectClose(fable.effectiveCacheWrite1hPerMTok, 20.0, "fable-5 1h cache write = 2x input")
+
+let opus48 = ModelPricingTable.price(for: "claude-opus-4-8")
+expectClose(opus48.inputPerMTok, 5.0, "opus 4.8 input price")
+expectClose(opus48.outputPerMTok, 25.0, "opus 4.8 output price")
+
 let prefixed = ModelPricingTable.price(for: "claude-opus-4-6-20260101")
-expectClose(prefixed.outputPerMTok, 75.0, "prefix fallback: dated opus id resolves to opus price")
+expectClose(prefixed.outputPerMTok, 25.0, "prefix fallback: dated opus id resolves to opus price")
 
 let unknown = ModelPricingTable.price(for: "some-future-model")
 expectClose(unknown.inputPerMTok, 3.0, "unknown model falls back to sonnet-tier default")
@@ -133,6 +156,11 @@ expectEqual(formatCost(1500), "$1.5K", "thousands of dollars")
 expectEqual(modelDisplayName("claude-sonnet-4-5-20250929"), "Sonnet 4 5",
             "date suffix stripped, words capitalized")
 expectEqual(modelDisplayName("claude-opus-4-6"), "Opus 4 6", "plain model id")
+
+expectEqual(sourceDisplayName("claude_code"), "Claude Code", "claude_code source label")
+expectEqual(sourceDisplayName("cowork"), "Cowork", "cowork source label")
+expectEqual(sourceDisplayName("some_future_source"), "Some Future Source",
+            "unknown source falls back to capitalized words")
 
 // MARK: - Result
 

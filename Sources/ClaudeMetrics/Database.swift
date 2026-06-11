@@ -42,6 +42,14 @@ final class ArgusDB {
         sqlite3_exec(db, "ALTER TABLE sessions ADD COLUMN cwd TEXT DEFAULT ''", nil, nil, nil)
         sqlite3_exec(db, "ALTER TABLE messages ADD COLUMN ai_lines INTEGER DEFAULT 0", nil, nil, nil)
         sqlite3_exec(db, "ALTER TABLE messages ADD COLUMN request_id TEXT NOT NULL DEFAULT ''", nil, nil, nil)
+        // Migration: tag every message with its ingestion source (claude_code | cowork).
+        // Existing rows all came from ~/.claude/projects, so the default is correct.
+        // Index created here (not in the schema string) so it runs after the ALTER on old DBs.
+        sqlite3_exec(db, "ALTER TABLE messages ADD COLUMN source TEXT NOT NULL DEFAULT 'claude_code'", nil, nil, nil)
+        sqlite3_exec(db, "CREATE INDEX IF NOT EXISTS idx_msg_day_source ON messages(day, source)", nil, nil, nil)
+        // Migration: track 1-hour ephemeral cache writes separately — they cost 2× input
+        // vs 1.25× for the 5-minute tier (cache_create_tokens stays the total of both).
+        sqlite3_exec(db, "ALTER TABLE messages ADD COLUMN cache_create_1h_tokens INTEGER DEFAULT 0", nil, nil, nil)
         // One-time: remove duplicate rows caused by Claude Code writing the same requestId twice.
         // Uses (session_id, timestamp) to identify duplicates because request_id is empty on
         // existing rows (the column was just added). Future ingestions skip duplicates via
@@ -95,12 +103,14 @@ final class ArgusDB {
             output_tokens     INTEGER DEFAULT 0,
             cache_read_tokens INTEGER DEFAULT 0,
             cache_create_tokens INTEGER DEFAULT 0,
+            cache_create_1h_tokens INTEGER DEFAULT 0,
             web_searches      INTEGER DEFAULT 0,
             cost_usd          REAL    DEFAULT 0,
             project           TEXT NOT NULL DEFAULT 'unknown',
             is_subagent       INTEGER DEFAULT 0,
             ai_lines          INTEGER DEFAULT 0,
             request_id        TEXT NOT NULL DEFAULT '',
+            source            TEXT NOT NULL DEFAULT 'claude_code',
             PRIMARY KEY (file_path, line_num)
         );
         CREATE TABLE IF NOT EXISTS git_stats_cache (
@@ -211,6 +221,7 @@ final class ArgusDB {
 
     var accountFilter: String?
     var projectFilter: String?
+    var sourceFilter: String?
 
     // SQL fragments appended to WHERE. Values come from our own DB, but project names
     // derive from directory names — escape quotes so an apostrophe can't break the query.
@@ -221,12 +232,14 @@ final class ArgusDB {
         var parts: [String] = []
         if let f = accountFilter { parts.append("AND account_uuid = '\(sqlQuote(f))'") }
         if let p = projectFilter { parts.append("AND project = '\(sqlQuote(p))'") }
+        if let s = sourceFilter  { parts.append("AND source = '\(sqlQuote(s))'") }
         return parts.joined(separator: " ")
     }
     private func af(_ alias: String) -> String {
         var parts: [String] = []
         if let f = accountFilter { parts.append("AND \(alias).account_uuid = '\(sqlQuote(f))'") }
         if let p = projectFilter { parts.append("AND \(alias).project = '\(sqlQuote(p))'") }
+        if let s = sourceFilter  { parts.append("AND \(alias).source = '\(sqlQuote(s))'") }
         return parts.joined(separator: " ")
     }
 
@@ -270,7 +283,7 @@ final class ArgusDB {
     }
 
     @discardableResult
-    func ingestFiles(_ files: [(url: URL, isSubagent: Bool)], account: AccountInfo?) throws -> IngestReport {
+    func ingestFiles(_ files: [(url: URL, isSubagent: Bool, source: String)], account: AccountInfo?) throws -> IngestReport {
         var report = IngestReport()
         // Load already-processed line counts
         var linesProcessed: [String: Int] = [:]
@@ -305,8 +318,9 @@ final class ArgusDB {
             INSERT OR REPLACE INTO messages
             (file_path,line_num,session_id,timestamp,day,hour,model,
              input_tokens,output_tokens,cache_read_tokens,cache_create_tokens,
-             web_searches,cost_usd,project,is_subagent,account_uuid,ai_lines,request_id)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+             web_searches,cost_usd,project,is_subagent,account_uuid,ai_lines,request_id,source,
+             cache_create_1h_tokens)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """)
         let toolInsert = try prepare(
             "INSERT OR IGNORE INTO tool_events(file_path,line_num,session_id,day,count) VALUES(?,?,?,?,?)")
@@ -315,7 +329,7 @@ final class ArgusDB {
         let utInsert = try prepare(
             "INSERT OR IGNORE INTO user_turns(file_path,line_num,session_id,timestamp,day) VALUES(?,?,?,?,?)")
 
-        for (fileURL, isSubagent) in files {
+        for (fileURL, isSubagent, source) in files {
             let path = fileURL.path
             let startLine = linesProcessed[path] ?? 0
 
@@ -339,9 +353,11 @@ final class ArgusDB {
                 newCwds[sid] = cwd
             }
 
-            // Insert newly-discovered sessions
+            // Insert newly-discovered sessions.
+            // Cowork sessions run in a sandbox whose cwd/path slug is meaningless —
+            // group them all under a single "Cowork" project.
             for (sid, cwd) in newCwds {
-                let proj = resolvedProject(cwd: cwd, fileURL: fileURL)
+                let proj = source == "cowork" ? "Cowork" : resolvedProject(cwd: cwd, fileURL: fileURL)
                 bindTxt(sessInsert, 1, sid)
                 bindTxt(sessInsert, 2, proj)
                 bindInt(sessInsert, 3, isSubagent ? 1 : 0)
@@ -392,6 +408,9 @@ final class ArgusDB {
                     let output = usage["output_tokens"]               as? Int ?? 0
                     let cr     = usage["cache_read_input_tokens"]     as? Int ?? 0
                     let cc     = usage["cache_creation_input_tokens"] as? Int ?? 0
+                    // usage.cache_creation breaks the total down by TTL — the 1h tier costs 2× input
+                    let ccDetail = usage["cache_creation"] as? [String: Any] ?? [:]
+                    let cc1h   = min(cc, ccDetail["ephemeral_1h_input_tokens"] as? Int ?? 0)
                     // server_tool_use.web_search_requests is always 0 in Claude Code JSONL;
                     // actual web searches appear as tool_use blocks with name "WebSearch"
                     let contentBlocks = msg["content"] as? [[String: Any]] ?? []
@@ -427,8 +446,10 @@ final class ArgusDB {
                     guard input + output + cr + cc > 0 else { continue }
 
                     let hour = parseDate(ts).map { cal.component(.hour, from: $0) } ?? 0
-                    let proj = sessionProjects[sid] ?? resolvedProject(cwd: nil, fileURL: fileURL)
-                    let cost = ModelPricingTable.price(for: model).cost(input: input, output: output, cr: cr, cc: cc)
+                    let proj = sessionProjects[sid]
+                        ?? (source == "cowork" ? "Cowork" : resolvedProject(cwd: nil, fileURL: fileURL))
+                    let cost = ModelPricingTable.price(for: model)
+                        .cost(input: input, output: output, cr: cr, cc5m: cc - cc1h, cc1h: cc1h)
 
                     bindTxt(msgInsert,  1, path);   bindInt(msgInsert,  2, lineNum)
                     bindTxt(msgInsert,  3, sid);    bindTxt(msgInsert,  4, ts)
@@ -442,6 +463,8 @@ final class ArgusDB {
                     else { sqlite3_bind_null(msgInsert, 16) }
                     bindInt(msgInsert, 17, aiLines)
                     bindTxt(msgInsert, 18, reqId)
+                    bindTxt(msgInsert, 19, source)
+                    bindInt(msgInsert, 20, cc1h)
                     sqlite3_step(msgInsert)
                     sqlite3_reset(msgInsert)
                 }
@@ -528,6 +551,8 @@ final class ArgusDB {
         let dailyAccountCosts    = try queryDailyAccountCosts()
         let dailyHourCosts       = try queryDailyHourCosts()
         let latestTs             = try queryLatestMessageTimestamp()
+        let dailySourceCosts     = try queryDailySourceCosts()
+        let knownSources         = try queryKnownSources()
 
         let dailyCosts = Dictionary(uniqueKeysWithValues: dailyTotals.map { ($0.date, $0.estimatedCostUSD) })
 
@@ -562,7 +587,9 @@ final class ArgusDB {
             dailyAvgResponseTimeSec: dailyAvgResponseTime.isEmpty ? nil : dailyAvgResponseTime,
             dailyAccountCosts: dailyAccountCosts.isEmpty ? nil : dailyAccountCosts,
             dailyHourCosts: dailyHourCosts.isEmpty ? nil : dailyHourCosts,
-            latestMessageTimestamp: latestTs
+            latestMessageTimestamp: latestTs,
+            dailySourceCosts: dailySourceCosts.isEmpty ? nil : dailySourceCosts,
+            knownSourcesList: knownSources.isEmpty ? nil : knownSources
         )
     }
 
@@ -572,14 +599,15 @@ final class ArgusDB {
         let stmt = try prepare("""
             SELECT day, model,
                 SUM(input_tokens), SUM(output_tokens),
-                SUM(cache_read_tokens), SUM(cache_create_tokens), SUM(web_searches)
+                SUM(cache_read_tokens), SUM(cache_create_tokens), SUM(web_searches),
+                SUM(cache_create_1h_tokens)
             FROM messages WHERE day != '' \(af)
             GROUP BY day, model ORDER BY day
         """)
-        var byDay: [String: [String: (Int, Int, Int, Int, Int)]] = [:]
+        var byDay: [String: [String: (Int, Int, Int, Int, Int, Int)]] = [:]
         while sqlite3_step(stmt) == SQLITE_ROW {
             let day = colTxt(stmt, 0); let model = colTxt(stmt, 1)
-            byDay[day, default: [:]][model] = (colInt(stmt,2), colInt(stmt,3), colInt(stmt,4), colInt(stmt,5), colInt(stmt,6))
+            byDay[day, default: [:]][model] = (colInt(stmt,2), colInt(stmt,3), colInt(stmt,4), colInt(stmt,5), colInt(stmt,6), colInt(stmt,7))
         }
         sqlite3_finalize(stmt)
 
@@ -600,7 +628,9 @@ final class ArgusDB {
             let totCC  = modelMap.values.reduce(0) { $0 + $1.3 }
             let totWS  = modelMap.values.reduce(0) { $0 + $1.4 }
             let cost   = modelMap.reduce(0.0) { s, p in
-                s + ModelPricingTable.price(for: p.key).cost(input: p.value.0, output: p.value.1, cr: p.value.2, cc: p.value.3)
+                s + ModelPricingTable.price(for: p.key)
+                    .cost(input: p.value.0, output: p.value.1, cr: p.value.2,
+                          cc5m: p.value.3 - p.value.5, cc1h: p.value.5)
             }
             let savings = modelMap.reduce(0.0) { s, p in
                 let pr = ModelPricingTable.price(for: p.key)
@@ -985,6 +1015,42 @@ final class ArgusDB {
         }
     }
 
+    private func queryDailySourceCosts() throws -> [DailySourceCosts] {
+        let stmt = try prepare("""
+            SELECT day, source, SUM(cost_usd), COUNT(*)
+            FROM messages
+            WHERE day != '' \(af)
+            GROUP BY day, source
+            ORDER BY day
+        """)
+        defer { sqlite3_finalize(stmt) }
+        var byCosts: [String: [String: Double]] = [:]
+        var byMsgs:  [String: [String: Int]]    = [:]
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            let day = colTxt(stmt, 0)
+            let src = colTxt(stmt, 1)
+            byCosts[day, default: [:]][src] = colDbl(stmt, 2)
+            byMsgs[day,  default: [:]][src] = colInt(stmt, 3)
+        }
+        return byCosts.keys.sorted().map {
+            DailySourceCosts(date: $0, costs: byCosts[$0]!, messages: byMsgs[$0] ?? [:])
+        }
+    }
+
+    func queryKnownSources() throws -> [String] {
+        // Use account filter only (not source filter) so the picker always shows all sources
+        let accountClause = accountFilter.map { "AND account_uuid = '\(sqlQuote($0))'" } ?? ""
+        let stmt = try prepare("""
+            SELECT DISTINCT source FROM messages
+            WHERE source IS NOT NULL AND source != '' \(accountClause)
+            ORDER BY source
+        """)
+        defer { sqlite3_finalize(stmt) }
+        var result: [String] = []
+        while sqlite3_step(stmt) == SQLITE_ROW { result.append(colTxt(stmt, 0)) }
+        return result
+    }
+
     private func queryDailyAvgResponseTime() throws -> [String: Double] {
         let stmt = try prepare("""
             SELECT m.day,
@@ -1127,6 +1193,64 @@ final class ArgusDB {
                 sqlite3_step(upd); sqlite3_reset(upd)
             }
         }
+        try execSQL("COMMIT")
+    }
+
+    // One-shot after a pricing-table change: re-read the JSONLs to populate
+    // cache_create_1h_tokens on historical rows, then recompute cost_usd for every
+    // message with the current ModelPricingTable. Guarded by UserDefaults in MetricsStore.
+    func backfillCacheTiersAndRecomputeCosts() throws {
+        var paths: [String] = []
+        let s = try prepare("SELECT path FROM ingested_files")
+        while sqlite3_step(s) == SQLITE_ROW { paths.append(colTxt(s, 0)) }
+        sqlite3_finalize(s)
+
+        try execSQL("BEGIN")
+
+        // Pass 1: populate cache_create_1h_tokens from usage.cache_creation
+        let upd = try prepare("""
+            UPDATE messages SET cache_create_1h_tokens = ?
+            WHERE file_path = ? AND line_num = ? AND cache_create_1h_tokens = 0
+            """)
+        for path in paths {
+            guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+                  let text = String(data: data, encoding: .utf8) else { continue }
+            let lines = text.split(separator: "\n", omittingEmptySubsequences: true)
+            for (i, line) in lines.enumerated() {
+                guard let obj = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+                      obj["type"] as? String == "assistant",
+                      let msg = obj["message"] as? [String: Any],
+                      let usage = msg["usage"] as? [String: Any],
+                      let detail = usage["cache_creation"] as? [String: Any],
+                      let cc1h = detail["ephemeral_1h_input_tokens"] as? Int, cc1h > 0 else { continue }
+                bindInt(upd, 1, cc1h); bindTxt(upd, 2, path); bindInt(upd, 3, i + 1)
+                sqlite3_step(upd); sqlite3_reset(upd)
+            }
+        }
+        sqlite3_finalize(upd)
+
+        // Pass 2: recompute cost_usd for every row with the current price table
+        var rows: [(rowid: Int, model: String, inp: Int, out: Int, cr: Int, cc: Int, cc1h: Int)] = []
+        let q = try prepare("""
+            SELECT rowid, model, input_tokens, output_tokens,
+                   cache_read_tokens, cache_create_tokens, cache_create_1h_tokens
+            FROM messages
+            """)
+        while sqlite3_step(q) == SQLITE_ROW {
+            rows.append((colInt(q,0), colTxt(q,1), colInt(q,2), colInt(q,3), colInt(q,4), colInt(q,5), colInt(q,6)))
+        }
+        sqlite3_finalize(q)
+
+        let costUpd = try prepare("UPDATE messages SET cost_usd = ? WHERE rowid = ?")
+        defer { sqlite3_finalize(costUpd) }
+        for r in rows {
+            let cc1h = min(r.cc, r.cc1h)
+            let cost = ModelPricingTable.price(for: r.model)
+                .cost(input: r.inp, output: r.out, cr: r.cr, cc5m: r.cc - cc1h, cc1h: cc1h)
+            bindDbl(costUpd, 1, cost); bindInt(costUpd, 2, r.rowid)
+            sqlite3_step(costUpd); sqlite3_reset(costUpd)
+        }
+
         try execSQL("COMMIT")
     }
 

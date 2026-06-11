@@ -189,6 +189,40 @@ struct OverviewView: View {
                     }
                 }
 
+                // Source breakdown (Claude Code vs Cowork) — only when more than one source has data
+                let sourceCosts = store.filteredSourceCosts
+                if sourceCosts.count > 1 {
+                    let totalSourceCost = sourceCosts.reduce(0) { $0 + $1.costUSD }
+                    SectionCard(title: "By Source", icon: "square.stack.3d.up") {
+                        VStack(spacing: 10) {
+                            ForEach(sourceCosts) { src in
+                                HStack {
+                                    Label(sourceDisplayName(src.source), systemImage: sourceIconName(src.source))
+                                        .font(.system(size: 13))
+                                        .foregroundStyle(Color.appTextSecondary)
+                                    Spacer()
+                                    Text("\(src.messageCount) msgs · \(formatCost(src.costUSD))")
+                                        .font(.system(size: 13, weight: .semibold))
+                                        .foregroundStyle(Color.appTextPrimary)
+                                }
+                            }
+                            if totalSourceCost > 0 {
+                                GeometryReader { geo in
+                                    HStack(spacing: 2) {
+                                        ForEach(Array(sourceCosts.enumerated()), id: \.offset) { idx, src in
+                                            let colors: [Color] = [Color.appAccent, .orange, .purple]
+                                            RoundedRectangle(cornerRadius: 3)
+                                                .fill(colors[idx % colors.count])
+                                                .frame(width: max(4, geo.size.width * CGFloat(src.costUSD / totalSourceCost)))
+                                        }
+                                    }
+                                }
+                                .frame(height: 8)
+                            }
+                        }
+                    }
+                }
+
                 // Agent type
                 let subCost  = store.filteredSubagentCost
                 let dirCost  = store.filteredDirectCost

@@ -267,6 +267,24 @@ struct SidebarView: View {
                         .padding(.horizontal, 8)
                     }
 
+                    // Source filter (Claude Code vs Cowork)
+                    if store.knownSources.count > 1 {
+                        SidebarSectionLabel("SOURCE")
+                        VStack(spacing: 2) {
+                            SidebarFilterRow(icon: "square.stack.3d.up.fill", label: "All Sources",
+                                             isSelected: store.sourceFilter == nil) {
+                                store.sourceFilter = nil
+                            }
+                            ForEach(store.knownSources, id: \.self) { src in
+                                SidebarFilterRow(icon: sourceIconName(src), label: sourceDisplayName(src),
+                                                 isSelected: store.sourceFilter == src) {
+                                    store.sourceFilter = src
+                                }
+                            }
+                        }
+                        .padding(.horizontal, 8)
+                    }
+
                     // Project filter
                     if store.knownProjects.count > 1 {
                         SidebarSectionLabel("PROJECT")

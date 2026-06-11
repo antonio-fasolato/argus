@@ -83,3 +83,26 @@ func modelDisplayName(_ model: String) -> String {
         .map { $0.prefix(1).uppercased() + $0.dropFirst() }
         .joined(separator: " ")
 }
+
+// Ingestion source ids stored in messages.source ("claude_code" | "cowork")
+func sourceDisplayName(_ source: String) -> String {
+    switch source {
+    case "claude_code": return "Claude Code"
+    case "cowork":      return "Cowork"
+    case "chat":        return "Chat"
+    default:
+        return source
+            .split(separator: "_")
+            .map { $0.prefix(1).uppercased() + $0.dropFirst() }
+            .joined(separator: " ")
+    }
+}
+
+func sourceIconName(_ source: String) -> String {
+    switch source {
+    case "claude_code": return "terminal"
+    case "cowork":      return "macwindow"
+    case "chat":        return "bubble.left"
+    default:            return "questionmark.circle"
+    }
+}
